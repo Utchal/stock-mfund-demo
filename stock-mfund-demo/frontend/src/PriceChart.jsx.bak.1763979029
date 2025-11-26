@@ -1,0 +1,133 @@
+import React from "react";
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, Legend,
+  ResponsiveContainer, CartesianGrid
+} from "recharts";
+
+/*
+  Robust PriceChart component
+  - Expects props: stockSeries = [{date, close}], indexSeries = [{date, close}]
+  - Defensive parsing (ensures numbers)
+  - Visible strokes + dots so lines show reliably
+  - Debug panel under chart showing rows, min/max, and first rows
+*/
+
+function toNumber(v) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+export default function PriceChart({
+  stockSeries = [],
+  indexSeries = [],
+  overlayIndex = true,
+  height = 360
+}) {
+  // Build index map for quick lookup
+  const idxMap = new Map();
+  (indexSeries || []).forEach(pt => {
+    if (pt && pt.date) idxMap.set(pt.date, toNumber(pt.close));
+  });
+
+  // Merge into unified data by stockSeries date
+  const data = (stockSeries || []).map(pt => ({
+    date: pt.date,
+    stock: toNumber(pt.close),
+    index: idxMap.has(pt.date) ? idxMap.get(pt.date) : null
+  }));
+
+  // debug samples and stats
+  const sample = data.slice(0, 8);
+  const stockVals = data.map(d => d.stock).filter(x => x !== null);
+  const indexVals = data.map(d => d.index).filter(x => x !== null);
+  const minStock = stockVals.length ? Math.min(...stockVals) : null;
+  const maxStock = stockVals.length ? Math.max(...stockVals) : null;
+  const minIndex = indexVals.length ? Math.min(...indexVals) : null;
+  const maxIndex = indexVals.length ? Math.max(...indexVals) : null;
+
+  if (data.length === 0) {
+    return (
+      <div style={{ height, border: "1px solid #eee", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ color: "#777" }}>No price history available.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ width: "100%", height }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 20, right: 20, left: 8, bottom: 20 }}>
+            <CartesianGrid strokeDasharray="4 4" />
+            <XAxis dataKey="date" tick={{ fontSize: 12 }} minTickGap={20} />
+            <YAxis tick={{ fontSize: 12 }} />
+            <Tooltip formatter={(val) => (val === null ? "N/A" : Number(val).toLocaleString())} />
+            <Legend verticalAlign="bottom" height={36} />
+
+            <Line
+              type="monotone"
+              dataKey="stock"
+              name="Stock"
+              stroke="#0b66ff"
+              strokeWidth={2.5}
+              dot={{ r: 1.4 }}
+              isAnimationActive={false}
+            />
+
+            {overlayIndex && (
+              <Line
+                type="monotone"
+                dataKey="index"
+                name="Index"
+                stroke="#ff7f0e"
+                strokeWidth={2}
+                dot={{ r: 1.2 }}
+                isAnimationActive={false}
+              />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Debug panel */}
+      <div style={{ marginTop: 8, fontSize: 13 }}>
+        <strong>Chart debug</strong>
+        <div style={{ color: "#555", marginTop: 6 }}>
+          rows: <strong>{data.length}</strong>
+          {" • "}
+          stock min/max: <strong>{minStock ?? "N/A"}</strong> / <strong>{maxStock ?? "N/A"}</strong>
+          {" • "}
+          index min/max: <strong>{minIndex ?? "N/A"}</strong> / <strong>{maxIndex ?? "N/A"}</strong>
+        </div>
+
+        <div style={{ marginTop: 8 }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", maxWidth: 820 }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #eee" }}>#</th>
+                <th style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #eee" }}>date</th>
+                <th style={{ textAlign: "right", padding: 6, borderBottom: "1px solid #eee" }}>stock</th>
+                <th style={{ textAlign: "right", padding: 6, borderBottom: "1px solid #eee" }}>index</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sample.map((r, i) => (
+                <tr key={i}>
+                  <td style={{ padding: 6, borderBottom: "1px dashed #f0f0f0" }}>{i}</td>
+                  <td style={{ padding: 6, borderBottom: "1px dashed #f0f0f0" }}>{r.date}</td>
+                  <td style={{ padding: 6, textAlign: "right", borderBottom: "1px dashed #f0f0f0" }}>
+                    {r.stock === null ? "null" : r.stock.toFixed(3)}
+                  </td>
+                  <td style={{ padding: 6, textAlign: "right", borderBottom: "1px dashed #f0f0f0" }}>
+                    {r.index === null ? "null" : Number(r.index).toFixed(3)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,141 @@
+import React, { useState } from "react";
+import axios from "axios";
+import PriceChart from "./PriceChart";
+import { API_BASE } from "./config";
+
+export default function App() {
+  const [symbol, setSymbol] = useState("RELIANCE.NS");
+  const [startDate, setStartDate] = useState("01-01-2020");
+  const [investment, setInvestment] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [analysis, setAnalysis] = useState(null); // holds full JSON from API
+  const [showRaw, setShowRaw] = useState(false);
+
+  async function handleAnalyze(e) {
+    e && e.preventDefault();
+    setLoading(true);
+    setError(null);
+
+    try {
+      const payload = {
+        symbol: symbol.trim(),
+        start_date: startDate.trim(),
+      };
+      if (investment && investment.toString().trim() !== "") {
+        payload.investment_amount = Number(investment);
+      }
+
+      const resp = await axios.post(`${API_BASE}/analysis`, payload, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 30_000,
+      });
+
+      setAnalysis(resp.data || null);
+
+      // helpful debug: expose to window for quick inspection in browser console
+      try { window.__lastAnalysis = resp.data; } catch (e) { /* noop */ }
+
+    } catch (err) {
+      console.error("analysis error", err);
+      setError(err?.response?.data?.detail || err.message || "Unknown error");
+      setAnalysis(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // derived chart series — defensive fallbacks
+  const stockSeries = (analysis && analysis.main && Array.isArray(analysis.main.history))
+    ? analysis.main.history
+    : [];
+
+  // prefer Nifty50 comparison if available, else Sensex
+  const indexSeries =
+    (analysis && analysis.comparisons && analysis.comparisons.Nifty50 && analysis.comparisons.Nifty50.metrics && Array.isArray(analysis.comparisons.Nifty50.metrics.history))
+      ? analysis.comparisons.Nifty50.metrics.history
+      : (analysis && analysis.comparisons && analysis.comparisons.Sensex && analysis.comparisons.Sensex.metrics && Array.isArray(analysis.comparisons.Sensex.metrics.history))
+        ? analysis.comparisons.Sensex.metrics.history
+        : [];
+
+  return (
+    <div style={{ fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial", padding: 24 }}>
+      <h1>Stock & Mutual Fund Analysis — Demo</h1>
+
+      <form style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" }} onSubmit={handleAnalyze}>
+        <div>
+          <label>Symbol</label><br />
+          <input value={symbol} onChange={(e) => setSymbol(e.target.value)} />
+        </div>
+
+        <div>
+          <label>Start Date (DD-MM-YYYY)</label><br />
+          <input value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </div>
+
+        <div>
+          <label>Investment (optional)</label><br />
+          <input value={investment} onChange={(e) => setInvestment(e.target.value)} />
+        </div>
+
+        <div>
+          <button type="submit" disabled={loading} style={{ padding: "8px 16px" }}>
+            {loading ? "Analyzing..." : "Analyze"}
+          </button>
+        </div>
+
+        <div style={{ marginLeft: 12 }}>
+          <a href={`${API_BASE}/analysis/export?symbol=${encodeURIComponent(symbol)}&start_date=${encodeURIComponent(startDate)}${investment ? `&investment_amount=${encodeURIComponent(investment)}` : ""}`} target="_blank" rel="noreferrer">Download CSV</a>
+        </div>
+      </form>
+
+      {error && (
+        <div style={{ marginTop: 12, color: "darkred", background: "#fee", padding: 12, borderRadius: 6 }}>
+          <strong>Error:</strong> {String(error)}
+        </div>
+      )}
+
+      <div style={{ marginTop: 24, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+        <div style={{ border: "1px solid #eee", padding: 18, borderRadius: 6 }}>
+          <h2>{analysis?.main?.symbol ?? symbol} — Analysis</h2>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <tbody>
+              <tr><td>Start Date</td><td style={{ textAlign: "right" }}>{analysis?.main?.start_date ?? "-"}</td></tr>
+              <tr><td>Start Price</td><td style={{ textAlign: "right" }}>{analysis?.main?.start_price ?? "-"}</td></tr>
+              <tr><td>Current Price</td><td style={{ textAlign: "right" }}>{analysis?.main?.current_price ?? "-"}</td></tr>
+              <tr><td>Return %</td><td style={{ textAlign: "right" }}>{analysis?.main?.return_percent ? `${analysis.main.return_percent}%` : "-"}</td></tr>
+              <tr><td>Annualized %</td><td style={{ textAlign: "right" }}>{analysis?.main?.annualized_return_percent ? `${analysis.main.annualized_return_percent}%` : "-"}</td></tr>
+              <tr><td>Days</td><td style={{ textAlign: "right" }}>{analysis?.main?.days ?? "-"}</td></tr>
+              <tr><td>Units (if invested)</td><td style={{ textAlign: "right" }}>{analysis?.units ?? "-"}</td></tr>
+              <tr><td>Current Value</td><td style={{ textAlign: "right" }}>{analysis?.current_value ?? "-"}</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ border: "1px solid #eee", padding: 18, borderRadius: 6 }}>
+          <h2>Price Chart</h2>
+          <div style={{ height: 360 }}>
+            <PriceChart stockSeries={stockSeries} indexSeries={indexSeries} overlayIndex={true} />
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 18 }}>
+        <h3>Latest News</h3>
+        <ul>
+          {(analysis?.headlines || []).length === 0 && <li>No news found</li>}
+          {(analysis?.headlines || []).map((h, i) => (
+            <li key={i}><a href={h.link} target="_blank" rel="noreferrer">{h.title}</a><br /><small>{h.pubDate}</small></li>
+          ))}
+        </ul>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <label style={{ cursor: "pointer" }}>
+          <input type="checkbox" checked={showRaw} onChange={() => setShowRaw(!showRaw)} /> Show raw JSON
+        </label>
+        {showRaw && <pre style={{ maxHeight: 400, overflow: "auto", background: "#f7f7f7", padding: 12 }}>{JSON.stringify(analysis, null, 2)}</pre>}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+
+  backend:
+    build: ./backend
+    container_name: stock-backend
+    ports:
+      - "8000:8000"
+    networks:
+      - stocknet
+
+  frontend:
+    build: ./frontend
+    container_name: stock-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    networks:
+      - stocknet
+
+networks:
+  stocknet:
