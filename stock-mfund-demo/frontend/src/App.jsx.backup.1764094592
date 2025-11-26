@@ -1,0 +1,249 @@
+// import css at top of App.jsx if not already
+import "./App.css";
+
+// ... inside render / return ...
+
+<div className="results-grid">
+  {/* LEFT: Summary / Analysis card */}
+  <div className="results-card">
+    <h2>{data.main.symbol} — Analysis</h2>
+
+    <div className="summary">
+      <div className="summary-row"><strong>Start Date</strong> <span style={{float: 'right'}}>{data.main.start_date}</span></div>
+      <div className="summary-row"><strong>Start Price</strong> <span style={{float: 'right'}}>{data.main.start_price}</span></div>
+      <div className="summary-row"><strong>Current Price</strong> <span style={{float: 'right'}}>{data.main.current_price}</span></div>
+      {/* ...other rows... */}
+      <div className="summary-row"><strong>Current Value</strong> <span style={{float: 'right'}}>{data.current_value}</span></div>
+    </div>
+  </div>
+
+  {/* RIGHT: Chart card */}
+  <div className="results-card chart-container">
+    {/* Keep your chart component here; chart div will be centered and sized */}
+    <PriceChart stockSeries={stockSeries} indexSeries={indexSeries} />
+  </div>
+</div>
+import React, { useState } from "react";
+import PriceChart from "./PriceChart";
+import NewsList from "./NewsList";
+
+export default function App() {
+  const [symbol, setSymbol] = useState("RELIANCE.NS");
+  const [startDate, setStartDate] = useState("01-01-2020");
+  const [investment, setInvestment] = useState("10000");
+
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // ---- ANALYZE CALL ----
+  const analyze = async () => {
+    setLoading(true);
+    setResult(null);
+
+    try {
+      const response = await fetch("http://127.0.0.1:8000/analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol,
+          start_date: startDate,
+          investment_amount: investment,
+        }),
+      });
+
+      const data = await response.json();
+      setResult(data);
+    } catch (error) {
+      console.error("Analysis error:", error);
+      alert("Something went wrong. Check backend.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ---- CSV DOWNLOAD ----
+  const downloadCsv = async () => {
+    try {
+      const url = `http://127.0.0.1:8000/history_csv?symbol=${encodeURIComponent(
+        symbol
+      )}&start_date=${encodeURIComponent(startDate)}`;
+
+      window.location.href = url;
+    } catch (error) {
+      console.error("CSV download error", error);
+    }
+  };
+
+  return (
+    <div style={{ padding: "25px", fontFamily: "Arial, sans-serif" }}>
+      <h1>Stock & Mutual Fund Analysis — Demo</h1>
+
+      {/* ------- INPUTS ROW ------- */}
+      <div
+        style={{
+          display: "flex",
+          gap: "20px",
+          marginBottom: "25px",
+          alignItems: "center",
+        }}
+      >
+        {/* Symbol */}
+        <div>
+          <label>Symbol</label>
+          <br />
+          <input
+            type="text"
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value)}
+            style={{ padding: "6px", width: "180px" }}
+          />
+        </div>
+
+        {/* Start date */}
+        <div>
+          <label>Start Date (DD-MM-YYYY)</label>
+          <br />
+          <input
+            type="text"
+            value={startDate}
+            onChange={(e) => setStartDate(e.target.value)}
+            style={{ padding: "6px", width: "160px" }}
+          />
+        </div>
+
+        {/* Investment */}
+        <div>
+          <label>Investment (optional)</label>
+          <br />
+          <input
+            type="number"
+            value={investment}
+            onChange={(e) => setInvestment(e.target.value)}
+            style={{ padding: "6px", width: "140px" }}
+          />
+        </div>
+
+        {/* Analyze Button */}
+        <button
+          onClick={analyze}
+          style={{
+            padding: "8px 15px",
+            height: "38px",
+            marginTop: "18px",
+            cursor: "pointer",
+          }}
+        >
+          Analyze
+        </button>
+
+        {/* Download CSV */}
+        <button
+          onClick={downloadCsv}
+          style={{
+            marginTop: "18px",
+            marginLeft: "10px",
+            background: "none",
+            border: "none",
+            color: "blue",
+            cursor: "pointer",
+            textDecoration: "underline",
+          }}
+        >
+          Download CSV
+        </button>
+      </div>
+
+      {/* ====== LOADING SPINNER ====== */}
+      {loading && (
+        <div
+          style={{
+            marginTop: "40px",
+            fontSize: "22px",
+            fontWeight: "bold",
+            color: "#444",
+          }}
+        >
+          🔄 Loading… please wait
+        </div>
+      )}
+
+      {/* ====== RESULTS ====== */}
+      {result && (
+        <>
+          {/* HEADER */}
+          <div style={{ marginBottom: "15px", fontStyle: "italic" }}>
+            Results for <b>{result.main.symbol}</b> (as of{" "}
+            {new Date(result.generated_at).toLocaleString()})
+          </div>
+
+          <div style={{ display: "flex", gap: "40px" }}>
+            {/* LEFT PANEL — SUMMARY */}
+            <div
+              style={{
+                flex: 1,
+                background: "#fafafa",
+                padding: "20px",
+                borderRadius: "6px",
+                border: "1px solid #ddd",
+              }}
+            >
+              <h2>{result.main.symbol} — Analysis</h2>
+
+              <table style={{ width: "100%", marginTop: "10px" }}>
+                <tbody>
+                  <tr>
+                    <td><b>Start Date</b></td>
+                    <td>{result.main.start_date}</td>
+                  </tr>
+                  <tr>
+                    <td><b>Start Price</b></td>
+                    <td>{result.main.start_price}</td>
+                  </tr>
+                  <tr>
+                    <td><b>Current Price</b></td>
+                    <td>{result.main.current_price}</td>
+                  </tr>
+                  <tr>
+                    <td><b>Return %</b></td>
+                    <td>{result.main.return_percent}%</td>
+                  </tr>
+                  <tr>
+                    <td><b>Annualized %</b></td>
+                    <td>{result.main.annualized_return_percent}%</td>
+                  </tr>
+                  <tr>
+                    <td><b>Days</b></td>
+                    <td>{result.main.days}</td>
+                  </tr>
+                  {investment && (
+                    <>
+                      <tr>
+                        <td><b>Units (if invested)</b></td>
+                        <td>{result.units.toFixed(6)}</td>
+                      </tr>
+                      <tr>
+                        <td><b>Current Value</b></td>
+                        <td>{result.current_value.toFixed(2)}</td>
+                      </tr>
+                    </>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* RIGHT PANEL — CHART */}
+            <div style={{ flex: 1 }}>
+              <h2>Price Chart</h2>
+              <PriceChart history={result.main.history} />
+            </div>
+          </div>
+
+          {/* NEWS LIST */}
+          <div style={{ marginTop: "40px" }}>
+            <NewsList news={result.headlines} />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

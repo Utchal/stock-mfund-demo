@@ -1,238 +1,353 @@
-
-#!/usr/bin/env python3
+# main.py
 """
-Production-ready main.py for Stock & Mutual Fund Analysis - Demo
+Backend for Stock & Mutual Fund Analysis demo.
 
-- /analysis (POST)
-- /news (GET) with Google + Bing RSS fallback
-- /analysis/export (GET) CSV export
-- Defensive handling, logging, and no-return/null protection
+Endpoints:
+- POST /analysis
+  Body JSON: { "symbol": "RELIANCE.NS", "start_date": "DD-MM-YYYY", "investment_amount": 10000 }
+  Returns JSON with analysis, history, headlines, benchmarks.
+
+- GET /history_csv?symbol=...&start_date=DD-MM-YYYY
+  Returns CSV of history for symbol (text/csv).
+
+Notes:
+- This file is defensive with respect to yfinance return formats.
+- CORS enabled for local dev.
 """
-
-import logging
-import time
-from datetime import datetime, timedelta, date
-from typing import Optional, Dict, Any, List
-
-import feedparser
-import yfinance as yf
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
-import csv
 import io
+import logging
+from datetime import datetime, date
+from typing import List, Optional, Dict, Any
 
-# ---------- Config ----------
-NEWS_CACHE_TTL = 60 * 5
-MAX_NEWS_ITEMS = 8
+import pandas as pd
+import yfinance as yf
+import feedparser
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
-logger = logging.getLogger("stock-mfund-demo")
+logger = logging.getLogger("main")
+logging.basicConfig(level=logging.INFO)
 
-# ---------- App ----------
-app = FastAPI(title="Stock & Mutual Fund Analysis - Demo (Patched, Prod-ready)", version="1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Stock & Mutual Fund Analysis - Backend")
 
-# ---------- Simple News Cache ----------
-_news_cache: Dict[str, Dict[str, Any]] = {}
+# Allow CORS from local frontend for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # during dev; restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ---------- Models ----------
-class AnalysisRequest(BaseModel):
-    symbol: str
-    start_date: str  # DD-MM-YYYY
-    investment_amount: Optional[float] = None
+# --- Utility functions -----------------------------------------------------
 
-# ---------- Utilities ----------
-def _now_date() -> date:
-    return datetime.now().date()
-
-def safe_history_fetch(ticker: yf.Ticker, start_date: date, end_date: date, interval="1d"):
+def parse_dd_mm_yyyy(s: str) -> date:
+    """Parse date in DD-MM-YYYY and return datetime.date."""
     try:
-        hist = ticker.history(start=start_date, end=end_date, interval=interval)
-        return hist if not hist.empty else None
-    except Exception as exc:
-        logger.warning("yfinance history fetch failed for %s: %s", getattr(ticker, "ticker", "N/A"), exc)
+        return datetime.strptime(s, "%d-%m-%Y").date()
+    except Exception:
+        raise ValueError("start_date must be in DD-MM-YYYY format")
+
+
+def _find_close_column(df: pd.DataFrame):
+    """
+    Return the DataFrame column object representing the close price, or None.
+    Accepts MultiIndex and single-level columns. Matches case-insensitively.
+    """
+    if df is None or df.empty:
         return None
 
-def get_price_on(ticker: yf.Ticker, target_date: date):
-    try:
-        end_date = target_date + timedelta(days=3)
-        hist = safe_history_fetch(ticker, target_date, end_date)
-        if hist is None:
-            return None, ""
-        row = hist.iloc[0]
-        close_price = float(row.get("Close", 0.0))
-        ts = row.name.strftime("%Y-%m-%d")
-        return close_price, ts
-    except Exception as exc:
-        logger.exception("get_price_on error for %s at %s: %s", getattr(ticker, "ticker", "N/A"), target_date, exc)
-        return None, ""
+    cols = df.columns
+    # Flatten names for matching
+    if isinstance(cols, pd.MultiIndex):
+        flat = [" ".join(map(str, c)).strip() for c in cols]
+    else:
+        flat = [str(c) for c in cols]
 
-def get_history_series(ticker: yf.Ticker, start_date: date, interval="1d"):
+    mapping = {flat[i].lower(): cols[i] for i in range(len(flat))}
+
+    # Preferred names
+    for candidate in ("close", "adj close", "adjusted close", "close_price", "Close"):
+        if candidate.lower() in mapping:
+            return mapping[candidate.lower()]
+
+    # any column that contains 'close'
+    for name_lower, orig in mapping.items():
+        if "close" in name_lower:
+            return orig
+
+    # fallback: pick numeric column with most non-null values
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric_cols:
+        best = max(numeric_cols, key=lambda c: df[c].count())
+        return best
+
+    return None
+
+
+def fetch_history(ticker: str, start_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetch daily history for `ticker` starting from `start_date`.
+    Returns list of dicts: [{'date': 'YYYY-MM-DD', 'close': float}, ...]
+    Raises ValueError for clear user-facing errors.
+    """
+    logger.info("Fetching history for %s from %s", ticker, start_date)
     try:
-        end_date = _now_date() + timedelta(days=1)
-        hist = safe_history_fetch(ticker, start_date, end_date, interval=interval)
-        if hist is None:
-            return []
-        out = []
-        for idx, row in hist.iterrows():
-            out.append({"date": idx.date().isoformat(), "close": float(row.get("Close", 0.0))})
-        return out
+        # NOTE: yfinance now auto_adjusts by default in recent versions; be explicit if needed.
+        df = yf.download(ticker, start=start_date.isoformat(), progress=False, threads=False)
+    except Exception as e:
+        logger.exception("yfinance download failed for %s", ticker)
+        raise ValueError(f"yfinance download failed for {ticker}: {e}")
+
+    if df is None or df.empty:
+        raise ValueError(f"No historical data returned for symbol {ticker} from {start_date.isoformat()}")
+
+    # find close-like column
+    col = _find_close_column(df)
+    if col is None:
+        logger.error("fetch_history error for %s: no close-like column. Columns: %s", ticker, list(df.columns))
+        raise ValueError(f"No close-like column found for {ticker}. Columns: {list(df.columns)}")
+
+    # coerce and drop NA
+    series = pd.to_numeric(df[col], errors="coerce")
+    series = series.dropna()
+    if series.empty:
+        logger.error("fetch_history error for %s: after dropping NA in %s no rows remain", ticker, col)
+        raise ValueError(f"No usable price rows for {ticker} in column {col}")
+
+    out = []
+    for ts, val in series.items():
+        try:
+            datestr = ts.strftime("%Y-%m-%d")
+        except Exception:
+            datestr = str(ts)
+        out.append({"date": datestr, "close": float(val)})
+    logger.info("Fetched %d rows for %s (col=%s)", len(out), ticker, col)
+    return out
+
+
+def compute_basic_metrics(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Given history (date-ordered list of {date, close}), return metrics:
+    start_date, start_price, current_price, absolute_return, return_percent,
+    annualized_return_percent (approx), days, history (unchanged).
+    """
+    if not history:
+        raise ValueError("Empty history")
+
+    # ensure sorted by date ascending
+    hist_sorted = sorted(history, key=lambda r: r["date"])
+    start = hist_sorted[0]
+    end = hist_sorted[-1]
+    start_price = float(start["close"])
+    current_price = float(end["close"])
+
+    start_date = start["date"]
+    current_date = end["date"]
+
+    # days between
+    try:
+        d0 = datetime.strptime(start_date, "%Y-%m-%d").date()
+        d1 = datetime.strptime(current_date, "%Y-%m-%d").date()
+        days = (d1 - d0).days or 1
     except Exception:
-        logger.exception("get_history_series failed for %s", getattr(ticker, "ticker", "N/A"))
-        return []
+        days = len(hist_sorted)
 
-# ---------- NEWS helpers ----------
-def _fetch_news_rss(url: str) -> List[Dict[str, str]]:
+    absolute_return = current_price - start_price
+    return_percent = (absolute_return / start_price * 100.0) if start_price != 0 else None
+
+    # annualized (simple approximation)
+    years = days / 365.25
     try:
-        feed = feedparser.parse(url)
-        status = getattr(feed, "status", None)
-        entries = getattr(feed, "entries", [])
-        logger.info("RSS fetch: url=%s status=%s entries=%d", url, status, len(entries))
-        out = []
-        for e in entries[:MAX_NEWS_ITEMS]:
-            out.append({
-                "title": getattr(e, "title", "") or "",
-                "link": getattr(e, "link", "") or "",
-                "pubDate": getattr(e, "published", "") or ""
-            })
-        return out
+        if start_price > 0 and years > 0:
+            annualized = ((current_price / start_price) ** (1.0 / years) - 1.0) * 100.0
+        else:
+            annualized = None
     except Exception:
-        logger.exception("Failed to parse RSS: %s", url)
-        return []
-
-def get_news(symbol: str) -> List[Dict[str, str]]:
-    google_url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-IN&gl=IN&ceid=IN:en"
-    bing_url = f"https://www.bing.com/news/search?q={symbol}+stock&format=rss"
-    items = _fetch_news_rss(google_url)
-    if items:
-        return items
-    return _fetch_news_rss(bing_url)
-
-# ---------- Analyzer ----------
-def analyze_ticker(symbol: str, start_str: str) -> Dict[str, Any]:
-    try:
-        chosen_date = datetime.strptime(start_str, "%d-%m-%Y").date()
-    except ValueError:
-        logger.error("Invalid start_date format: %s", start_str)
-        raise HTTPException(status_code=400, detail="start_date must be DD-MM-YYYY")
-
-    t = yf.Ticker(symbol)
-    start_price, start_ts = get_price_on(t, chosen_date)
-    if start_price is None:
-        start_price = 0.0
-        start_ts = ""
-
-    today = _now_date()
-    current_price, current_ts = get_price_on(t, today - timedelta(days=3))
-    if current_price is None:
-        current_price = start_price
-        current_ts = ""
-
-    days = max((today - chosen_date).days, 1)
-    absolute = current_price - start_price
-    pct_return = (absolute / start_price * 100.0) if start_price else 0.0
-    cagr = (current_price / start_price) ** (365.0 / days) - 1 if start_price else 0.0
-    history_series = get_history_series(t, chosen_date)
+        annualized = None
 
     return {
-        "symbol": symbol,
-        "start_date": chosen_date.strftime("%d-%m-%Y"),
-        "start_price": round(start_price, 6),
-        "current_price": round(current_price, 6),
-        "current_price_ts": current_ts,
-        "absolute_return": round(absolute, 6),
-        "return_percent": round(pct_return, 6),
-        "annualized_return_percent": round(cagr * 100, 6),
+        "start_date": start_date,
+        "start_price": start_price,
+        "current_price": current_price,
+        "absolute_return": absolute_return,
+        "return_percent": return_percent,
+        "annualized_return_percent": annualized,
         "days": days,
-        "history": history_series
+        "history": hist_sorted,
     }
 
-# ---------- Endpoints ----------
-@app.get("/health", response_class=PlainTextResponse)
-def health():
-    return "ok"
 
-@app.get("/news")
-def news(symbol: str):
+def fetch_headlines_for_symbol(symbol: str, max_items: int = 10) -> List[Dict[str, Any]]:
+    """
+    Try to fetch news headlines from Google News RSS for the symbol/company.
+    This is simple: search Google News RSS for the company ticker - coarse but works for demo.
+    """
+    # A quick approach: use the 'news' search for the symbol
+    # Note: feedparser will accept a Google News RSS query.
+    query = f"https://news.google.com/rss/search?q={symbol}"
     try:
-        items = get_news(symbol)
-        return {"symbol": symbol, "headlines": items}
-    except Exception as exc:
-        logger.exception("news endpoint error for %s", symbol)
-        return JSONResponse({"error": "failed to fetch news", "detail": str(exc)}, status_code=500)
+        feed = feedparser.parse(query)
+    except Exception:
+        logger.exception("Failed to fetch headlines for %s", symbol)
+        return []
+
+    items = []
+    for entry in feed.entries[:max_items]:
+        items.append({
+            "title": entry.get("title"),
+            "link": entry.get("link"),
+            "published": entry.get("published"),
+        })
+    return items
+
+
+# --- Routes ----------------------------------------------------------------
 
 @app.post("/analysis")
-def analysis(payload: AnalysisRequest):
+async def analysis(payload: Dict[str, Any]):
+    """
+    Expected payload:
+      { "symbol": "RELIANCE.NS", "start_date": "DD-MM-YYYY", "investment_amount": 10000 }
+    """
     try:
-        symbol = payload.symbol
-        start_date = payload.start_date
-        amount = payload.investment_amount
-
-        logger.info("Analysis requested for %s from %s (amount=%s)", symbol, start_date, amount)
-
-        main_info = analyze_ticker(symbol, start_date)
-        sensex = analyze_ticker("^BSESN", start_date)
-        nifty50 = analyze_ticker("^NSEI", start_date)
-
-        comparisons = {
-            "Sensex": {"metrics": sensex, "note": "BSE Sensex"},
-            "Nifty50": {"metrics": nifty50, "note": "NSE Nifty 50"}
-        }
-
-        units = None
-        current_value = None
-        if amount:
-            units = round(amount / main_info["start_price"], 6) if main_info["start_price"] else 0.0
-            current_value = round(units * main_info["current_price"], 6)
-
-        headlines = get_news(symbol)
-
-        payload_out = {
-            "main": main_info,
-            "comparisons": comparisons,
-            "investment_amount": amount,
-            "units": units,
-            "current_value": current_value,
-            "headlines": headlines,
-            "generated_at": datetime.now().isoformat()
-        }
-        return payload_out
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Unhandled error in /analysis")
-        return JSONResponse({"error": "internal_server_error", "detail": str(exc)}, status_code=500)
-
-@app.get("/analysis/export")
-def analysis_export(
-    symbol: str = Query(...),
-    start_date: str = Query(...),
-    investment_amount: Optional[float] = Query(None)
-):
-    try:
-        data = analysis(AnalysisRequest(symbol=symbol, start_date=start_date, investment_amount=investment_amount))
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-
-        writer.writerow(["Metric", "Value"])
-        writer.writerow(["Symbol", data["main"]["symbol"]])
-        writer.writerow(["Start Date", data["main"]["start_date"]])
-        writer.writerow(["Start Price", data["main"]["start_price"]])
-        writer.writerow(["Current Price", data["main"]["current_price"]])
-        writer.writerow(["Return %", data["main"]["return_percent"]])
-        writer.writerow(["Annualized %", data["main"]["annualized_return_percent"]])
-
-        if investment_amount:
-            writer.writerow(["Units", data["units"]])
-            writer.writerow(["Current Value", data["current_value"]])
-
-        output.seek(0)
-        return output.getvalue()
+        symbol = payload.get("symbol")
+        start_date_str = payload.get("start_date")
+        investment_amount = payload.get("investment_amount", None)
     except Exception:
-        logger.exception("analysis_export failed")
-        raise HTTPException(status_code=500, detail="export failed")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if not symbol or not start_date_str:
+        raise HTTPException(status_code=400, detail="symbol and start_date are required")
+
+    # parse start_date
+    try:
+        start_dt = parse_dd_mm_yyyy(start_date_str)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Main symbol history
+    try:
+        history = fetch_history(symbol, start_dt)
+    except ValueError as e:
+        # 400 error for user-facing problems
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error fetching history for %s", symbol)
+        raise HTTPException(status_code=500, detail=f"Unexpected error fetching data: {e}")
+
+    # Optional benchmarks: Nifty 50 and Sensex (NSE symbols commonly used)
+    index_history = {}
+    # Common tickers for Indian indices in Yahoo Finance:
+    # NIFTY 50 often '^NSEI' or '^NIFTYIT' etc; BSE Sensex '^BSESN'
+    try:
+        nifty = None
+        try:
+            nifty = fetch_history("^NSEI", start_dt)
+        except Exception:
+            # fallback attempts (some yfinance setups need ^NIFTYBE or others; ignore on failure)
+            nifty = None
+        if nifty:
+            index_history["nifty"] = nifty
+    except Exception:
+        logger.debug("Ignoring nifty fetch failure", exc_info=True)
+
+    try:
+        sensex = None
+        try:
+            sensex = fetch_history("^BSESN", start_dt)
+        except Exception:
+            sensex = None
+        if sensex:
+            index_history["sensex"] = sensex
+    except Exception:
+        logger.debug("Ignoring sensex fetch failure", exc_info=True)
+
+    # Compute metrics
+    metrics = compute_basic_metrics(history)
+
+    # investment math
+    units = None
+    current_value = None
+    if investment_amount not in (None, "", "null"):
+        try:
+            inv = float(investment_amount)
+            if metrics["start_price"] and metrics["start_price"] > 0:
+                units = inv / metrics["start_price"]
+                current_value = units * metrics["current_price"]
+        except Exception:
+            units = None
+            current_value = None
+
+    # Headline retrieval (best-effort)
+    headlines = []
+    try:
+        headlines = fetch_headlines_for_symbol(symbol, max_items=12)
+    except Exception:
+        headlines = []
+
+    resp = {
+        "main": {
+            "symbol": symbol,
+            "start_date": metrics["start_date"],
+            "start_price": metrics["start_price"],
+            "current_price": metrics["current_price"],
+            "absolute_return": metrics["absolute_return"],
+            "return_percent": f"{metrics['return_percent']:.6f}%" if metrics["return_percent"] is not None else None,
+            "annualized_return_percent": f"{metrics['annualized_return_percent']:.6f}%" if metrics["annualized_return_percent"] is not None else None,
+            "days": metrics["days"],
+            "history": metrics["history"],
+        },
+        "units": round(units, 6) if units is not None else None,
+        "current_value": round(current_value, 2) if current_value is not None else None,
+        "headlines": headlines,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+    # attach index histories if found
+    if index_history:
+        resp["benchmarks"] = index_history
+
+    return JSONResponse(resp)
+
+
+@app.get("/history_csv")
+async def history_csv(symbol: str, start_date: str):
+    """
+    Return a CSV for the requested symbol and start_date (DD-MM-YYYY).
+    """
+    try:
+        start_dt = parse_dd_mm_yyyy(start_date)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        hist = fetch_history(symbol, start_dt)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error fetching history CSV for %s", symbol)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+    # create CSV in memory
+    df = pd.DataFrame(hist)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    filename = f"{symbol.replace('/', '_')}_history_{start_date}.csv"
+    return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8")), media_type="text/csv",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+# Simple health-check
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# If run directly with uvicorn inside container:
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")

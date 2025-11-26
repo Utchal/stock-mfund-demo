@@ -1,0 +1,155 @@
+import React, { useState } from "react";
+import axios from "axios";
+import PriceChart from "./PriceChart";
+import { API_BASE } from "./config";
+
+function SmallStat({ label, value }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: 6, borderBottom: "1px solid #eee" }}>
+      <strong>{label}</strong>
+      <span>{value ?? "—"}</span>
+    </div>
+  );
+}
+
+export default function App() {
+  const [symbol, setSymbol] = useState("RELIANCE.NS");
+  const [startDate, setStartDate] = useState("01-01-2020");
+  const [investment, setInvestment] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const exportCsvUrl = () => {
+    const amt = investment ? `&investment_amount=${encodeURIComponent(investment)}` : "";
+    return `${API_BASE}/analysis/export?symbol=${encodeURIComponent(symbol)}&start_date=${encodeURIComponent(startDate)}${amt}`;
+  };
+
+  async function analyze() {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+
+    try {
+      const payload = {
+        symbol: symbol,
+        start_date: startDate,
+      };
+      if (investment) payload.investment_amount = Number(investment);
+
+      const resp = await axios.post(`${API_BASE}/analysis`, payload, { timeout: 15000 });
+      // backend returns JSON or { error: ... }
+      if (resp.data && resp.data.error) {
+        setError(resp.data.detail || resp.data.error);
+      } else {
+        setResult(resp.data);
+      }
+    } catch (err) {
+      console.error(err);
+      if (err.response && err.response.data) {
+        setError(err.response.data.detail || JSON.stringify(err.response.data));
+      } else {
+        setError(err.message || "Network or server error");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ maxWidth: 980, margin: "20px auto", fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial" }}>
+      <h2>Stock & Mutual Fund Analysis — Demo</h2>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+        <div>
+          <label style={{ display: "block", marginBottom: 6 }}>
+            Symbol
+            <input value={symbol} onChange={(e) => setSymbol(e.target.value)} style={{ width: 200, marginLeft: 8 }} />
+          </label>
+        </div>
+
+        <div>
+          <label style={{ display: "block", marginBottom: 6 }}>
+            Start Date (DD-MM-YYYY)
+            <input value={startDate} onChange={(e) => setStartDate(e.target.value)} style={{ width: 150, marginLeft: 8 }} />
+          </label>
+        </div>
+
+        <div>
+          <label style={{ display: "block", marginBottom: 6 }}>
+            Investment (optional)
+            <input value={investment} onChange={(e) => setInvestment(e.target.value)} style={{ width: 120, marginLeft: 8 }} />
+          </label>
+        </div>
+
+        <div>
+          <button onClick={analyze} disabled={loading} style={{ padding: "10px 16px", cursor: "pointer" }}>
+            {loading ? "Analyzing..." : "Analyze"}
+          </button>
+          <div style={{ marginTop: 8 }}>
+            <a href={exportCsvUrl()} target="_blank" rel="noreferrer" style={{ fontSize: 13 }}>
+              Download CSV
+            </a>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ background: "#fff3f0", border: "1px solid #ffcccc", padding: 12, borderRadius: 6, marginBottom: 12 }}>
+          <strong>Error:</strong> {String(error)}
+        </div>
+      )}
+
+      {result && (
+        <div style={{ background: "#fff", border: "1px solid #eee", padding: 16, borderRadius: 6 }}>
+          <h3 style={{ marginTop: 0 }}>{result.main?.symbol} — Analysis</h3>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div style={{ border: "1px solid #f0f0f0", padding: 8 }}>
+              <SmallStat label="Start Date" value={result.main?.start_date} />
+              <SmallStat label="Start Price" value={result.main?.start_price} />
+              <SmallStat label="Current Price" value={result.main?.current_price} />
+              <SmallStat label="Return %" value={result.main?.return_percent + "%" } />
+              <SmallStat label="Annualized %" value={result.main?.annualized_return_percent + "%"} />
+              <SmallStat label="Days" value={result.main?.days} />
+              <SmallStat label="Units (if invested)" value={result.units ?? "—"} />
+              <SmallStat label="Current Value" value={result.current_value ?? "—"} />
+            </div>
+
+            <div style={{ border: "1px solid #f0f0f0", padding: 8 }}>
+              <h4 style={{ marginTop: 0 }}>Price Chart</h4>
+              {result.main?.history && result.main.history.length > 0 ? (
+                <div style={{ height: 300 }}>
+                  <PriceChart data={result.main.history} />
+                </div>
+              ) : (
+                <div>No history available</div>
+              )}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <h4>Latest News</h4>
+            {result.headlines && result.headlines.length > 0 ? (
+              <ul>
+                {result.headlines.map((h, i) => (
+                  <li key={i} style={{ marginBottom: 8 }}>
+                    <a href={h.link} target="_blank" rel="noreferrer">{h.title}</a>
+                    <div style={{ fontSize: 12, color: "#666" }}>{h.pubDate}</div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div>No news found</div>
+            )}
+          </div>
+
+          <details style={{ marginTop: 12 }}>
+            <summary>Show raw JSON</summary>
+            <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(result, null, 2)}</pre>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}

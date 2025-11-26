@@ -1,0 +1,48 @@
+/* add to src/App.css (or to your existing global css file) */
+
+/* main results area grid */
+.results-grid {
+  display: grid;
+  grid-template-columns: 45% 55%;
+  gap: 28px;            /* space between the columns */
+  align-items: start;   /* align top edges */
+  margin-top: 18px;
+}
+
+/* card style adjustments */
+.results-card {
+  padding: 18px 22px;   /* reduce heavy padding */
+  box-sizing: border-box;
+}
+
+/* inside the left summary table, tighten row spacing */
+.results-card .summary-row {
+  padding: 12px 8px;    /* smaller rows */
+  line-height: 1.25;
+}
+
+/* chart container - force height so it visually matches left card */
+.chart-container {
+  height: 360px;        /* adjust as needed */
+  min-height: 280px;
+  display: flex;
+  align-items: center;  /* center chart vertically inside card */
+  justify-content: center;
+}
+
+/* reduce extra whitespace below header/title inside the left card */
+.results-card h2 {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
+/* responsive: stack on small screens */
+@media (max-width: 900px) {
+  .results-grid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .chart-container {
+    height: 300px;
+  }
+}

@@ -1,0 +1,193 @@
+import PriceChart from "./PriceChart";
+import React, { useState } from "react";
+import axios from "axios";
+import { API_BASE } from "./config";
+
+function SmallStat({ label, value }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: 6 }}>
+      <strong>{label}</strong>
+      <span>{value ?? "—"}</span>
+    </div>
+  );
+}
+
+export default function App() {
+  const [symbol, setSymbol] = useState("RELIANCE.NS");
+  const [startDate, setStartDate] = useState("01-01-2020");
+  const [amount, setAmount] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [overlayIndex, setOverlayIndex] = useState(true);
+
+  const analyze = async () => {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const payload = {
+        symbol,
+        start_date: startDate,
+        investment_amount: amount ? parseFloat(amount) : null,
+      };
+      const resp = await axios.post(`${API_BASE}/analysis`, payload, { timeout: 20000 });
+      setResult(resp.data);
+    } catch (e) {
+      console.error(e);
+      setError(e.response?.data?.detail || e.message || "Unexpected error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exportCsvUrl = () => {
+    const params = new URLSearchParams({
+      symbol,
+      start_date: startDate,
+    });
+    if (amount) params.set("investment_amount", amount);
+    return `${API_BASE}/analysis/export?${params.toString()}`;
+  };
+
+  return (
+    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 980, margin: "0 auto" }}>
+      <h1 style={{ textAlign: "center", marginBottom: 6 }}>Stock & Mutual Fund Analysis — Demo</h1>
+      <p style={{ textAlign: "center", color: "#666", marginTop: 0 }}>
+        Demo using Yahoo Finance & Google News RSS. Not financial advice.
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 10, alignItems: "end", marginTop: 12 }}>
+        <label style={{ display: "block" }}>
+          <div style={{ fontSize: 13, color: "#333", marginBottom: 6 }}>Symbol</div>
+          <input value={symbol} onChange={(e) => setSymbol(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label style={{ display: "block" }}>
+          <div style={{ fontSize: 13, color: "#333", marginBottom: 6 }}>Start Date (DD-MM-YYYY)</div>
+          <input value={startDate} onChange={(e) => setStartDate(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <label style={{ display: "block" }}>
+          <div style={{ fontSize: 13, color: "#333", marginBottom: 6 }}>Investment Amount (optional)</div>
+          <input value={amount} onChange={(e) => setAmount(e.target.value)} style={{ width: "100%", padding: 8 }} />
+        </label>
+
+        <div>
+          <button onClick={analyze} disabled={loading} style={{ padding: "10px 16px", cursor: "pointer" }}>
+            {loading ? "Analyzing..." : "Analyze"}
+          </button>
+          <div style={{ marginTop: 8 }}>
+            <a href={exportCsvUrl()} target="_blank" rel="noreferrer" style={{ fontSize: 13 }}>
+              Download CSV
+            </a>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ marginTop: 16, color: "#9b1c1c", background: "#ffecec", padding: 12, borderRadius: 6 }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 20 }}>
+        {/* Chart Section */}
+<div style={{ marginBottom: 20 }}>
+  <div style={{
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center"
+  }}>
+    <h3>Price Chart</h3>
+    <label style={{ fontSize: 13 }}>
+      <input
+        type="checkbox"
+        checked={overlayIndex}
+        onChange={(e) => setOverlayIndex(e.target.checked)}
+      /> Show Index
+    </label>
+  </div>
+
+  <PriceChart
+    stockSeries={result.main.history}
+    indexSeries={result.comparisons.Nifty50.metrics.history}
+    overlayIndex={overlayIndex}
+  />
+</div>
+          <h2 style={{ marginBottom: 8 }}>Results — <small style={{ color: "#666" }}>{result.main.symbol} (as of {new Date(result.generated_at).toLocaleString()})</small></h2>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div style={{ background: "#fff", padding: 12, borderRadius: 6, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+              <h3 style={{ marginTop: 0 }}>Security</h3>
+              <SmallStat label="Start Date" value={result.main.start_date} />
+              <SmallStat label="Start Price" value={result.main.start_price} />
+              <SmallStat label="Current Price" value={`${result.main.current_price} (${result.main.current_price_ts})`} />
+              <SmallStat label="Absolute Return" value={result.main.absolute_return} />
+              <SmallStat label="Return %" value={`${result.main.return_percent}%`} />
+              <SmallStat label="Annualized %" value={`${result.main.annualized_return_percent}%`} />
+              {result.investment_amount && (
+                <>
+                  <hr style={{ margin: "10px 0" }} />
+                  <SmallStat label="Units (approx)" value={result.units} />
+                  <SmallStat label="Holding Value" value={result.current_value} />
+                </>
+              )}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ background: "#fff", padding: 12, borderRadius: 6, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+                <h3 style={{ marginTop: 0 }}>Comparisons</h3>
+                {["Sensex", "Nifty50", "Sector"].map((k) => {
+                  const c = result.comparisons[k];
+                  const metrics = c?.metrics;
+                  return (
+                    <div key={k} style={{ borderTop: "1px solid #eee", paddingTop: 8, marginTop: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <strong>{k}</strong>
+                        <em style={{ fontSize: 12, color: "#666" }}>{c?.note ?? ""}</em>
+                      </div>
+                      {metrics ? (
+                        <div style={{ fontSize: 13, marginTop: 6 }}>
+                          <div><strong>Symbol:</strong> {metrics.symbol}</div>
+                          <div><strong>Start:</strong> {metrics.start_price}</div>
+                          <div><strong>Current:</strong> {metrics.current_price}</div>
+                          <div><strong>Return %:</strong> {metrics.return_percent}%</div>
+                          <div><strong>Annualized:</strong> {metrics.annualized_return_percent}%</div>
+                        </div>
+                      ) : (
+                        <div style={{ color: "#999", marginTop: 6 }}>No data available</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ background: "#fff", padding: 12, borderRadius: 6, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+                <h3 style={{ marginTop: 0 }}>Top headlines (last 7 days)</h3>
+                {result.headlines && result.headlines.length ? (
+                  <ul style={{ paddingLeft: 18 }}>
+                    {result.headlines.map((h, i) => (
+                      <li key={i} style={{ marginBottom: 8 }}>
+                        <a href={h.link} target="_blank" rel="noreferrer">{h.title}</a>
+                        <div style={{ color: "#777", fontSize: 12 }}>{h.pubDate}</div>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div style={{ color: "#666" }}>No headlines found.</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <details style={{ marginTop: 12 }}>
+            <summary>Show raw JSON</summary>
+            <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{JSON.stringify(result, null, 2)}</pre>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
