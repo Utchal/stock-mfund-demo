@@ -1,203 +1,142 @@
-// frontend/src/PriceChart.jsx
+// src/PriceChart.jsx
 import React, { useMemo } from "react";
 import {
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
+  Chart as ChartJS,
+  LineElement,
+  PointElement,
+  CategoryScale,
+  LinearScale,
+  TimeScale,
   Tooltip,
   Legend,
-} from "recharts";
+} from "chart.js";
+import { Line } from "react-chartjs-2";
+import "chartjs-adapter-date-fns";
+
+ChartJS.register(
+  LineElement,
+  PointElement,
+  CategoryScale,
+  LinearScale,
+  TimeScale,
+  Tooltip,
+  Legend
+);
 
 /**
- * PriceChart.jsx
- *
- * Props:
- *  - history: array of { date: "YYYY-MM-DD", close: number }  <-- stock series
- *  - indexHistory: optional array of { date, close }            <-- index / benchmark
- *  - overlayIndex: boolean (default true)                      <-- whether to show index
- *
- * Produces a merged series with both 'stock' and 'index' keys and
- * renders two lines with separate Y axes (index on the right).
+ * Align series by date and optionally normalize them (start = 100).
+ * Input:
+ *   stock: [{date: "YYYY-MM-DD", close: number}, ...]
+ *   indexes: [{symbol, history: [{date, close}, ...]}, ...]
  */
+function alignSeries(primary, others = []) {
+  // build set of all dates (use primary's dates as baseline for plotting)
+  const dateSet = new Set(primary.map((r) => r.date));
+  // ensure other dates are included (so indexes don't truncate)
+  others.forEach((ix) => ix.history.forEach((r) => dateSet.add(r.date)));
+  const dates = Array.from(dateSet).sort((a, b) => new Date(a) - new Date(b));
 
-function formatDateLabel(d) {
-  try {
-    const dt = new Date(d);
-    if (isNaN(dt.getTime())) return d;
-    return dt.toLocaleDateString(undefined, { year: "numeric", month: "short" });
-  } catch (e) {
-    return d;
-  }
+  const mapSeries = (arr) => {
+    const m = new Map(arr.map((r) => [r.date, r.close]));
+    return dates.map((d) => (m.has(d) ? m.get(d) : null));
+  };
+
+  const primaryVals = mapSeries(primary);
+  const otherVals = others.map((ix) => ({ symbol: ix.symbol, vals: mapSeries(ix.history) }));
+
+  return { dates, primaryVals, otherVals };
 }
 
-function isoDateString(d) {
-  // Accept either Date or string; return YYYY-MM-DD
-  const dt = d instanceof Date ? d : new Date(d);
-  if (isNaN(dt.getTime())) return d;
-  const yyyy = dt.getFullYear();
-  const mm = String(dt.getMonth() + 1).padStart(2, "0");
-  const dd = String(dt.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function normalizeArray(arr) {
+  // find first non-null
+  const idx = arr.findIndex((v) => v !== null && v !== undefined);
+  if (idx === -1) return arr.map(() => null);
+  const start = arr[idx];
+  if (!start || start === 0) return arr.map(() => null);
+  return arr.map((v) => (v === null || v === undefined ? null : (v / start) * 100));
 }
 
-export default function PriceChart({
-  history = [],
-  indexHistory = [],
-  overlayIndex = true,
-}) {
-  // Build merged array with {date, stock, index} -- date ascending
-  const merged = useMemo(() => {
-    // helper to accept multiple input shapes
-    const normArray = (arr) => {
-      if (!Array.isArray(arr)) return [];
-      return arr.map((r) => {
-        // r might be {date, close}, or {date, stock, index}, or {dt, close}, or {x, close}
-        const dateRaw = r.date ?? r.dt ?? r.x ?? r[0] ?? null;
-        const date = dateRaw ? isoDateString(dateRaw) : null;
-        // Accept close, Close, adjclose, adjClose etc
-        const close =
-          r.close ??
-          r.Close ??
-          r.adjClose ??
-          r["Adj Close"] ??
-          r.adj_close ??
-          r.adjclose;
-        // Accept named keys
-        const stock = r.stock;
-        const index = r.index;
-        return { date, close, stock, index };
-      });
-    };
+function buildDatasets(dates, primaryVals, otherVals, normalize) {
+  const datasets = [];
 
-    const stockArr = normArray(history);
-    const idxArr = normArray(indexHistory);
+  const pVals = normalize ? normalizeArray(primaryVals) : primaryVals;
+  datasets.push({
+    label: "Stock",
+    data: dates.map((d, i) => ({ x: d, y: pVals[i] })),
+    borderColor: "#2f72d6",
+    backgroundColor: "rgba(47,114,214,0.06)",
+    pointRadius: 0.5,
+    tension: 0.15,
+  });
 
-    // If `history` appears to already contain both stock & index (look at first item)
-    const sample = stockArr.length > 0 ? stockArr[0] : null;
-    let containsBoth = false;
-    if (sample && (sample.stock !== undefined || sample.index !== undefined)) {
-      containsBoth = true;
-    }
-
-    const map = new Map();
-
-    const push = (arr, keyFrom, keyTo) => {
-      for (const item of arr) {
-        if (!item || !item.date) continue;
-        const d = item.date;
-        const existing = map.get(d) || { date: d };
-        // prefer explicit stock/index if present
-        if (keyTo === "stock") {
-          // derive value: prefer item.stock then item.close
-          const val = item.stock ?? item.close ?? null;
-          existing.stock = val !== undefined ? val : existing.stock;
-        } else if (keyTo === "index") {
-          const val = item.index ?? item.close ?? null;
-          existing.index = val !== undefined ? val : existing.index;
-        }
-        map.set(d, existing);
-      }
-    };
-
-    if (containsBoth) {
-      // history already has both keys
-      push(stockArr, "close", "stock"); // this will set stock using stock/close
-      // if index present in same history entries, it was set above via sample detection +
-      // item.index assignment in normArray; ensure index from history pushed too:
-      // push again treating history elements' index values
-      for (const it of stockArr) {
-        if (!it.date) continue;
-        const ex = map.get(it.date) || { date: it.date };
-        if (it.index !== undefined) ex.index = it.index;
-        map.set(it.date, ex);
-      }
-    } else {
-      // treat history as stock series, indexHistory as index series
-      push(stockArr, "close", "stock");
-      push(idxArr, "close", "index");
-    }
-
-    // Now ensure that every date has both keys (may be null)
-    const dates = Array.from(map.keys()).sort();
-    const arr = dates.map((d) => {
-      const e = map.get(d) || { date: d };
-      return {
-        date: d,
-        stock: e.stock !== undefined ? e.stock : null,
-        index: e.index !== undefined ? e.index : null,
-      };
+  const palette = ["#f39c12", "#2ecc71", "#9b59b6", "#e74c3c"];
+  otherVals.forEach((ix, idx) => {
+    const vals = normalize ? normalizeArray(ix.vals) : ix.vals;
+    datasets.push({
+      label: ix.symbol,
+      data: dates.map((d, i) => ({ x: d, y: vals[i] })),
+      borderColor: palette[idx % palette.length],
+      backgroundColor: "transparent",
+      borderDash: [6, 4],
+      pointRadius: 0,
+      tension: 0.15,
+      yAxisID: normalize ? "y" : `y${idx > 0 ? idx + 1 : ""}`, // allow multiple axes if absolute
     });
+  });
 
-    return arr;
-  }, [history, indexHistory]);
+  return datasets;
+}
 
-  if (!merged || merged.length === 0) {
-    return (
-      <div style={{ minHeight: 260, display: "flex", alignItems: "center", justifyContent: "center", color: "#666" }}>
-        No series available to render chart.
-      </div>
-    );
-  }
+export default function PriceChart({ stock = [], indexes = [], normalize = true, height = 420 }) {
+  const { dates, primaryVals, otherVals } = useMemo(() => alignSeries(stock, indexes), [stock, indexes]);
 
-  // detect whether we have non-null index values
-  const hasIndex = overlayIndex && merged.some((d) => d.index !== null && d.index !== undefined);
+  const datasets = useMemo(() => buildDatasets(dates, primaryVals, otherVals, normalize), [dates, primaryVals, otherVals, normalize]);
+
+  // Determine right-side axis if not normalized (absolute indexes typically have much larger scale)
+  const options = useMemo(() => {
+    const base = {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        x: {
+          type: "time",
+          time: { unit: "month", tooltipFormat: "yyyy-MM-dd" },
+          ticks: { autoSkip: true, maxTicksLimit: 18 },
+          grid: { color: "rgba(0,0,0,0.06)" },
+        },
+        y: {
+          beginAtZero: true,
+          position: "left",
+          grid: { color: "rgba(0,0,0,0.06)" },
+          title: {
+            display: !!normalize,
+            text: normalize ? "Normalized (start=100)" : undefined,
+          },
+        },
+      },
+      plugins: {
+        legend: { position: "bottom" },
+        tooltip: { mode: "index", intersect: false },
+      },
+    };
+
+    // if not normalized and we have >0 indexes, add right y-axis for indexes
+    if (!normalize && indexes && indexes.length > 0) {
+      base.scales["yRight"] = {
+        position: "right",
+        grid: { drawOnChartArea: false },
+        beginAtZero: false,
+      };
+    }
+
+    return base;
+  }, [normalize, indexes]);
+
+  const data = { datasets };
 
   return (
-    <div style={{ width: "100%", height: 420 }}>
-      <ResponsiveContainer>
-        <LineChart data={merged} margin={{ top: 12, right: 50, left: 20, bottom: 40 }}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="date" tickFormatter={formatDateLabel} minTickGap={20} />
-          <YAxis yAxisId="left" allowDecimals={true} />
-          {hasIndex && <YAxis yAxisId="right" orientation="right" allowDecimals={true} />}
-          <Tooltip
-            labelFormatter={(lab) => {
-              try {
-                return new Date(lab).toLocaleString();
-              } catch {
-                return lab;
-              }
-            }}
-            formatter={(value, name) => {
-              if (value === null || value === undefined) return ["—", name];
-              if (typeof value === "number") return [value.toFixed(2), name];
-              return [String(value), name];
-            }}
-          />
-          <Legend verticalAlign="bottom" height={36} />
-
-          {/* Render index first (behind) */}
-          {hasIndex && (
-            <Line
-              type="monotone"
-              dataKey="index"
-              stroke="#ff8a00"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-              connectNulls={true}
-              name="Index"
-              yAxisId="right"
-            />
-          )}
-
-          {/* Stock line on left axis */}
-          <Line
-            type="monotone"
-            dataKey="stock"
-            stroke="#2f86f6"
-            strokeWidth={2}
-            dot={false}
-            isAnimationActive={false}
-            connectNulls={true}
-            name="Stock"
-            yAxisId="left"
-          />
-        </LineChart>
-      </ResponsiveContainer>
+    <div style={{ height }}>
+      <Line data={data} options={options} />
     </div>
   );
 }

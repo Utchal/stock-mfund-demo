@@ -1,333 +1,316 @@
-// App.jsx
-import React, { useEffect, useState, useRef } from "react";
-import Plot from "react-plotly.js";
-import "./styles.css";
+// src/App.jsx
+import React, { useEffect, useMemo, useState } from "react";
+import PriceChart from "./PriceChart"; // your chart component
+import "./styles.css"; // keep this if you have styles in the project
 
-/*
-  App.jsx - Stock + Index viewer
-  - Adds Index selector dropdown (None, ^NSEI, ^BSESN)
-  - Plots Stock and selected Index (index plotted on secondary y-axis when not normalized)
-  - Normalize to 100 option available
-  - Handles multiple shapes of backend response:
-      - result.history  (stock history list)
-      - result.indices (array of { symbol, history: [...] })
-    Older variants: result.indexes or result.indicesMap are also checked.
-*/
+const DEFAULT_SYMBOL = "RELIANCE.NS";
+const DEFAULT_START = "01-01-2020";
 
-function parseHistory(list) {
-  // input: [{date: "2020-01-01", close: 123.45}, ...]
-  if (!Array.isArray(list)) return { x: [], y: [] };
-  const x = list.map((r) => r.date);
-  const y = list.map((r) => r.close);
-  return { x, y };
+function formatNumber(v, decimals = 2) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "-";
+  return Number(v).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+function toCsvString(history) {
+  // history is array of {date, close}
+  if (!history || !history.length) return "";
+  const header = ["date", "close"];
+  const rows = history.map((r) => [r.date, r.close]);
+  const csv = [header, ...rows].map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  return csv;
 }
 
 export default function App() {
-  const [symbol, setSymbol] = useState("RELIANCE.NS");
-  const [start, setStart] = useState("01-01-2020");
-  const [invest, setInvest] = useState("10000");
+  const [symbol, setSymbol] = useState(DEFAULT_SYMBOL);
+  const [startDate, setStartDate] = useState(DEFAULT_START);
+  const [investment, setInvestment] = useState(10000);
+  const [data, setData] = useState(null); // raw response from backend
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
-  const [selectedIndex, setSelectedIndex] = useState("^NSEI");
-  const [normalize, setNormalize] = useState(true);
   const [error, setError] = useState(null);
+  const [showNormalized, setShowNormalized] = useState(true);
+  const [showIndexes, setShowIndexes] = useState(true);
 
-  const indexOptions = [
-    { label: "None", value: "None" },
-    { label: "Nifty 50 (^NSEI)", value: "^NSEI" },
-    { label: "Sensex (^BSESN)", value: "^BSESN" },
-  ];
+  // Derived pieces used for UI
+  const stockSeries = useMemo(() => {
+    if (!data || !data.history) return [];
+    return data.history.map((p) => ({ date: p.date, close: p.close }));
+  }, [data]);
 
-  const fetchAnalysis = async () => {
-    setLoading(true);
-    setError(null);
-    setResult(null);
-    try {
-      const payload = {
-        symbol: symbol,
-        start_date: start,
-        investment_amount: invest ? Number(invest) : undefined,
-      };
+  const indexes = useMemo(() => {
+    // The backend returns an "indexes" array (each index has { symbol, history })
+    if (!data || !data.indexes) return [];
+    return data.indexes.map((ix) => ({
+      symbol: ix.symbol,
+      history: ix.history || [],
+      start_price: ix.start_price,
+      current_price: ix.current_price,
+    }));
+  }, [data]);
 
-      // try local backend first (port 8000).
-      // If frontend reverse proxy is used, you may change endpoint.
-      const resp = await fetch("http://127.0.0.1:8000/analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+  // Summary fields (safe access)
+  const startPrice = data?.start_price ?? null;
+  const currentPrice = data?.current_price ?? null;
+  const returnPct = data?.return_pct ?? null;
+  const annualizedPct = data?.annualized_pct ?? null;
+  const units = data?.units ?? null;
+  const currentValue = data?.current_value ?? null;
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Server error ${resp.status}: ${text}`);
-      }
-
-      const data = await resp.json();
-      setResult(data);
-
-      // If backend returned multiple indices, and user has default selectedIndex,
-      // keep selectedIndex if available, otherwise set to first available index.
-      const indices = gatherIndicesFromResult(data);
-      if (indices.length > 0) {
-        const found = indices.find((i) => i.symbol === selectedIndex);
-        if (!found) {
-          // choose first available
-          setSelectedIndex(indices[0].symbol);
-        }
-      }
-    } catch (err) {
-      console.error("fetchAnalysis error", err);
-      setError(err.message || String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // collect indices from various possible response shapes
-  function gatherIndicesFromResult(res) {
-    if (!res) return [];
-    // prefer standardized names: result.indices (array)
-    if (Array.isArray(res.indices)) return res.indices.map((x) => ({ symbol: x.symbol, history: x.history }));
-    if (Array.isArray(res.indexes)) return res.indexes.map((x) => ({ symbol: x.symbol, history: x.history }));
-    if (Array.isArray(res.indicesMap)) {
-      return res.indicesMap; // assume already shape [{symbol, history}]
-    }
-    // Some older returned "indices" as nested in result (e.g. result.indices = [{symbol, history}])
-    // If backend included the index's history as separate key like res.indexHistory or res.index, try both:
-    if (res.index && res.index.history) return [{ symbol: res.index.symbol || "INDEX", history: res.index.history }];
-    // fallback: if result contains keys that look like index symbols (e.g., ^NSEI)
-    const detected = [];
-    Object.keys(res).forEach((k) => {
-      if (k === "history") return;
-      if (k.startsWith("^") || k.toUpperCase().includes("NSE") || k.toUpperCase().includes("BSE")) {
-        const val = res[k];
-        if (val && Array.isArray(val.history)) {
-          detected.push({ symbol: k, history: val.history });
-        }
-      }
-    });
-    return detected;
-  }
-
-  // Prepare traces for Plotly
-  function makeTraces() {
-    if (!result) return [];
-    // stock history is expected in result.history (array)
-    const stockHist = result.history || result.history_stock || (result.stock ? result.stock.history : null);
-    const stockSeries = parseHistory(stockHist || []);
-
-    // Get indices collection
-    const indices = gatherIndicesFromResult(result);
-
-    // find selectedIndex series if present
-    let indexSeries = { x: [], y: [] };
-    if (selectedIndex && selectedIndex !== "None") {
-      // find in indices list
-      const found = indices.find((it) => it.symbol === selectedIndex);
-      if (found && found.history) indexSeries = parseHistory(found.history);
-      else {
-        // maybe backend returned index under result.indicesMap[selectedIndex]
-        if (result.indicesMap && result.indicesMap[selectedIndex]) {
-          indexSeries = parseHistory(result.indicesMap[selectedIndex].history || []);
-        }
-      }
-    }
-
-    // If normalize requested, convert both series to index=100 at first visible point
-    if (normalize) {
-      const baseStock = stockSeries.y && stockSeries.y.length ? stockSeries.y[0] : null;
-      const baseIndex = indexSeries.y && indexSeries.y.length ? indexSeries.y[0] : null;
-      const sY = baseStock ? stockSeries.y.map((v) => (v / baseStock) * 100) : [];
-      const iY = baseIndex ? indexSeries.y.map((v) => (v / baseIndex) * 100) : [];
-      const stockTrace = {
-        x: stockSeries.x,
-        y: sY,
-        name: "Stock",
-        mode: "lines",
-        line: { shape: "spline", smoothing: 0.5 },
-        hovertemplate: "%{x}<br>Stock: %{y:.2f}<extra></extra>",
-        yaxis: "y",
-      };
-      const traces = [stockTrace];
-      if (selectedIndex && selectedIndex !== "None" && iY.length) {
-        traces.push({
-          x: indexSeries.x,
-          y: iY,
-          name: "Index",
-          mode: "lines",
-          line: { shape: "spline", smoothing: 0.5, dash: "dash", width: 2, color: "#ff7f0e" },
-          hovertemplate: "%{x}<br>Index: %{y:.2f}<extra></extra>",
-          yaxis: "y",
-        });
-      }
-      return traces;
-    } else {
-      // not normalized -> use secondary y-axis for index (y2)
-      const stockTrace = {
-        x: stockSeries.x,
-        y: stockSeries.y,
-        name: "Stock",
-        mode: "lines",
-        line: { shape: "spline", smoothing: 0.5 },
-        hovertemplate: "%{x}<br>Stock: %{y:.2f}<extra></extra>",
-        yaxis: "y",
-      };
-      const traces = [stockTrace];
-      if (selectedIndex && selectedIndex !== "None" && indexSeries.y.length) {
-        traces.push({
-          x: indexSeries.x,
-          y: indexSeries.y,
-          name: "Index",
-          mode: "lines",
-          line: { shape: "spline", smoothing: 0.5, dash: "dash", width: 2, color: "#ff7f0e" },
-          hovertemplate: "%{x}<br>Index: %{y:.2f}<extra></extra>",
-          yaxis: "y2",
-        });
-      }
-      return traces;
-    }
-  }
-
-  // layout for Plotly
-  function makeLayout() {
-    const baseLayout = {
-      margin: { t: 20, r: 60, b: 60, l: 60 },
-      legend: { orientation: "h", xanchor: "center", x: 0.5, y: -0.15 },
-      xaxis: { tickformat: "%b %Y", showgrid: true },
-      yaxis: { title: "", showgrid: true },
-      height: 420,
-      plot_bgcolor: "#ffffff",
-      paper_bgcolor: "#ffffff",
-    };
-
-    if (!normalize) {
-      // if index exists we provide a y2 axis on right
-      baseLayout.yaxis2 = {
-        overlaying: "y",
-        side: "right",
-        title: "",
-        showgrid: false,
-      };
-    }
-    return baseLayout;
-  }
-
-  const traces = makeTraces();
-  const layout = makeLayout();
-
-  // Utilities to show header metrics in top-right small summary
-  function topSummary() {
-    if (!result) return "";
-    const startP = result.start_price || "-";
-    const currentP = result.current_price || "-";
-    const ret = result.return_pct ? `${Number(result.return_pct).toFixed(1)}%` : "-";
-    return `Start: ${startP} • Current: ${currentP} • Return: ${ret}`;
-  }
-
-  // on first load, fetch automatically
   useEffect(() => {
-    fetchAnalysis();
+    // initial load
+    analyze();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // index options shown depend on what backend returned
-  const availableIndices = (() => {
-    const defaultList = indexOptions;
-    if (!result) return defaultList;
-    const indicesFromBackend = gatherIndicesFromResult(result);
-    if (!indicesFromBackend || !indicesFromBackend.length) return defaultList;
-    // build option list from what backend returned
-    const built = [{ label: "None", value: "None" }, ...indicesFromBackend.map((i) => ({ label: i.symbol, value: i.symbol }))];
-    return built;
-  })();
+  async function analyze() {
+    setLoading(true);
+    setError(null);
+    setData(null);
+    try {
+      const body = {
+        symbol: (symbol || "").trim(),
+        start_date: startDate,
+        investment_amount: investment ? Number(investment) : undefined,
+      };
+      const resp = await fetch("/analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Server error: ${resp.status} ${errText}`);
+      }
+      const json = await resp.json();
+      setData(json);
+    } catch (e) {
+      console.error("analysis failed", e);
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function downloadCsv() {
+    if (!data || !data.history) return;
+    const csv = toCsvString(data.history);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${symbol || "analysis"}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
 
   return (
-    <div style={{ padding: 18, fontFamily: "Arial, Helvetica, sans-serif" }}>
-      <h1 style={{ marginBottom: 8 }}>Stock + Index Viewer</h1>
+    <div className="app-root" style={{ padding: 24 }}>
+      <header style={{ marginBottom: 18 }}>
+        <h1 style={{ margin: 0 }}>PriceHound — Stock & Index Preview</h1>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 12, flexWrap: "wrap" }}>
+          <label>
+            Symbol{" "}
+            <input value={symbol} onChange={(e) => setSymbol(e.target.value)} style={{ width: 150 }} />
+          </label>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
-        <label>
-          Symbol
-          <input style={{ marginLeft: 6, padding: 8 }} value={symbol} onChange={(e) => setSymbol(e.target.value)} />
-        </label>
+          <label>
+            Start{" "}
+            <input value={startDate} onChange={(e) => setStartDate(e.target.value)} style={{ width: 120 }} />
+          </label>
 
-        <label>
-          Start
-          <input style={{ marginLeft: 6, padding: 8 }} value={start} onChange={(e) => setStart(e.target.value)} />
-        </label>
-
-        <label>
-          Invest ₹
-          <input style={{ marginLeft: 6, padding: 8, width: 110 }} value={invest} onChange={(e) => setInvest(e.target.value)} />
-        </label>
-
-        <button onClick={fetchAnalysis} style={{ padding: "10px 14px" }}>
-          {loading ? "Loading..." : "Run"}
-        </button>
-
-        <div style={{ marginLeft: "auto", color: "#444", alignSelf: "center" }}>{topSummary()}</div>
-      </div>
-
-      <div style={{ display: "flex", gap: 22, alignItems: "flex-start" }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ marginBottom: 8, fontWeight: 700 }}>Results for <em>{symbol}</em> {result && result.generated_at ? `(as of ${result.generated_at})` : ""}</div>
-
-          <div style={{ background: "#fafafa", borderRadius: 6, padding: 18, minHeight: 220 }}>
-            <h2 style={{ marginTop: 0 }}>{symbol} — Summary</h2>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 120px", gap: 6 }}>
-              <div>Start Date</div><div style={{ textAlign: "right" }}>{result ? result.start_date : "-"}</div>
-              <div>Start Price</div><div style={{ textAlign: "right" }}>{result ? result.start_price : "-"}</div>
-              <div>Current Price</div><div style={{ textAlign: "right" }}>{result ? result.current_price : "-"}</div>
-              <div>Return %</div><div style={{ textAlign: "right" }}>{result ? (result.return_pct !== undefined ? `${Number(result.return_pct).toFixed(1)}%` : "-") : "-"}</div>
-              <div>Annualized %</div><div style={{ textAlign: "right" }}>{result ? (result.annualized_pct !== undefined ? `${Number(result.annualized_pct).toFixed(1)}%` : "-") : "-"}</div>
-              <div>Days</div><div style={{ textAlign: "right" }}>{result ? (result.history_points || "-") : "-"}</div>
-              <div>Units (if invested)</div><div style={{ textAlign: "right" }}>{result ? (result.units ? Number(result.units).toFixed(6) : "-") : "-"}</div>
-              <div>Current Value</div><div style={{ textAlign: "right" }}>{result ? (result.current_value ? Number(result.current_value).toFixed(2) : "-") : "-"}</div>
-            </div>
-          </div>
-        </div>
-
-        <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <h2 style={{ marginTop: 0 }}>Price Chart</h2>
-            <div>
-              <label style={{ marginRight: 8 }}>
-                Index:
-                <select value={selectedIndex} onChange={(e) => setSelectedIndex(e.target.value)} style={{ marginLeft: 8 }}>
-                  {availableIndices.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                </select>
-              </label>
-
-              <label style={{ marginLeft: 12 }}>
-                <input type="checkbox" checked={normalize} onChange={(e) => setNormalize(e.target.checked)} /> Normalize to 100
-              </label>
-            </div>
-          </div>
-
-          <div style={{ borderRadius: 8, background: "#fff", padding: 12 }}>
-            {error && <div style={{ color: "crimson" }}>Error: {error}</div>}
-            <Plot
-              data={traces}
-              layout={layout}
-              config={{ responsive: true, displayModeBar: false }}
-              style={{ width: "100%" }}
+          <label>
+            Investment{" "}
+            <input
+              value={investment}
+              onChange={(e) => setInvestment(e.target.value)}
+              style={{ width: 120 }}
+              type="number"
             />
-            <div style={{ textAlign: "center", marginTop: 6, color: "#2b6cb0", fontWeight: 600 }}>
-              <span style={{ marginRight: 10 }}>◌</span> Stock &nbsp;&nbsp;
-              {selectedIndex && selectedIndex !== "None" && <span style={{ color: "#ff7f0e", marginLeft: 12 }}>◌</span>} Index
+          </label>
+
+          <button onClick={analyze} disabled={loading} style={{ padding: "6px 12px" }}>
+            {loading ? "Working..." : "Analyze"}
+          </button>
+
+          <div style={{ marginLeft: "auto", display: "flex", gap: 12, alignItems: "center" }}>
+            <div>
+              <span style={{ marginRight: 8 }}>
+                Start: {startPrice ? formatNumber(startPrice, 2) : "--"} • Current:{" "}
+                {currentPrice ? formatNumber(currentPrice, 2) : "--"} • Return: {returnPct ? formatNumber(returnPct, 2) : "--"}%
+              </span>
             </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={showNormalized}
+                onChange={(e) => setShowNormalized(e.target.checked)}
+              />
+              Show normalized
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={showIndexes} onChange={(e) => setShowIndexes(e.target.checked)} />
+              Show index overlays
+            </label>
+          </div>
+        </div>
+      </header>
+
+      {error && (
+        <div style={{ color: "crimson", marginBottom: 12 }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {/* Chart */}
+      <div style={{ background: "#fff", borderRadius: 8, padding: 20, boxShadow: "0 0 0 1px rgba(0,0,0,.03)" }}>
+        <h2 style={{ marginTop: 0, marginBottom: 8 }}>
+          {symbol?.toUpperCase()} • start {data?.start_date ?? "--"} • start price {startPrice ? formatNumber(startPrice, 2) : "--"} • current{" "}
+          {currentPrice ? formatNumber(currentPrice, 2) : "--"}
+        </h2>
+
+        <PriceChart
+          stock={stockSeries}
+          indexes={showIndexes ? indexes : []}
+          normalize={showNormalized}
+          height={420}
+        />
+
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 12 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <span style={{ color: "#888" }}>Legend: </span>
+            <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+              <svg width="18" height="8">
+                <rect width="18" height="4" fill="#2f72d6" />
+              </svg>
+              <span>Stock</span>
+            </span>
+            {indexes && indexes.length > 0 && (
+              <>
+                <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+                  <svg width="18" height="8">
+                    <rect width="18" height="4" fill="#f39c12" />
+                  </svg>
+                  <span>^NSEI</span>
+                </span>
+                <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+                  <svg width="18" height="8">
+                    <rect width="18" height="4" fill="#2ecc71" />
+                  </svg>
+                  <span>^BSESN</span>
+                </span>
+              </>
+            )}
           </div>
         </div>
       </div>
 
-      <div style={{ marginTop: 26 }}>
-        <h3>Latest News</h3>
-        <ul>
-          {result && result.headlines && result.headlines.length > 0 ? result.headlines.map((h, i) => (
-            <li key={i}><a href={h.link} target="_blank" rel="noreferrer">{h.title}</a><div style={{ fontSize: 12, color: "#666" }}>{h.published}</div></li>
-          )) : <li>No recent news found.</li>}
-        </ul>
+      {/* Headlines */}
+      <div style={{ display: "flex", gap: 24, marginTop: 22, alignItems: "flex-start" }}>
+        <div style={{ flex: 1 }}>
+          {data && data.headlines && data.headlines.length > 0 ? (
+            <div style={{ marginBottom: 18 }}>
+              <h3>Latest headlines</h3>
+              <ul style={{ paddingLeft: 18 }}>
+                {data.headlines.map((h, i) => (
+                  <li key={i} style={{ marginBottom: 8 }}>
+                    <a href={h.link} target="_blank" rel="noopener noreferrer">
+                      {h.title}
+                    </a>
+                    <div style={{ fontSize: 12, color: "#666" }}>{h.published}</div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div style={{ marginBottom: 18 }}>
+              <h3>Latest headlines</h3>
+              <div style={{ color: "#666" }}>No headlines</div>
+            </div>
+          )}
+        </div>
+
+        {/* Summary panel */}
+        <aside style={{ width: 360 }}>
+          <div style={{ background: "#fafafa", padding: 16, borderRadius: 8 }}>
+            <h3 style={{ marginTop: 0 }}>Summary</h3>
+            <div>
+              <div>
+                <strong>Symbol:</strong> {symbol}
+              </div>
+              <div>
+                <strong>Start date:</strong> {data?.start_date ?? "--"}
+              </div>
+              <div>
+                <strong>Start price:</strong> {startPrice ? formatNumber(startPrice, 2) : "--"}
+              </div>
+              <div>
+                <strong>Current price:</strong> {currentPrice ? formatNumber(currentPrice, 2) : "--"}
+              </div>
+              <div>
+                <strong>Return:</strong> {returnPct ? `${formatNumber(returnPct, 2)}%` : "--"}
+              </div>
+              <div>
+                <strong>Annualized:</strong> {annualizedPct ? `${formatNumber(annualizedPct, 2)}%` : "--"}
+              </div>
+              <div>
+                <strong>Units (if invested):</strong> {units ? formatNumber(units, 6) : "--"}
+              </div>
+              <div>
+                <strong>Current Value:</strong> {currentValue ? formatNumber(currentValue, 2) : "--"}
+              </div>
+
+              <div style={{ marginTop: 12, display: "flex", gap: 6 }}>
+                <button onClick={downloadCsv} disabled={!data || !data.history}>
+                  Download CSV
+                </button>
+                <button
+                  onClick={() => {
+                    setSymbol(DEFAULT_SYMBOL);
+                    setStartDate(DEFAULT_START);
+                    setInvestment(10000);
+                    setData(null);
+                    setError(null);
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+          </div>
+        </aside>
       </div>
+
+      {/* History preview table */}
+      <section style={{ marginTop: 22 }}>
+        <h3>History (last 10)</h3>
+        <div style={{ overflowX: "auto", background: "#fff", borderRadius: 8, padding: 12 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ textAlign: "left", borderBottom: "1px solid #eee" }}>
+                <th style={{ padding: "6px 8px" }}>Date</th>
+                <th style={{ padding: "6px 8px" }}>Close</th>
+                {indexes && indexes.length > 0 && <th style={{ padding: "6px 8px" }}>Index (first)</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {(data?.history || []).slice(0, 10).map((r, i) => (
+                <tr key={i}>
+                  <td style={{ padding: "8px" }}>{r.date}</td>
+                  <td style={{ padding: "8px" }}>{formatNumber(r.close, 2)}</td>
+                  {indexes && indexes.length > 0 && (
+                    <td style={{ padding: "8px" }}>
+                      {indexes[0] && indexes[0].history && indexes[0].history[i]
+                        ? formatNumber(indexes[0].history[i].close, 2)
+                        : "-"}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
   );
 }

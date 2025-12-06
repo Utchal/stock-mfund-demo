@@ -1,4 +1,4 @@
-# main.py
+# backend/main.py
 import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
@@ -10,6 +10,7 @@ import yfinance as yf
 import requests
 import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -31,8 +32,8 @@ class AnalysisRequest(BaseModel):
     investment_amount: Optional[float] = None
 
 
+# ---------- utilities ----------
 def parse_start_date(s: str) -> date:
-    """Try multiple common date formats; return a date object or raise ValueError."""
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -41,33 +42,36 @@ def parse_start_date(s: str) -> date:
     raise ValueError(f"Invalid start_date format: {s}. Accepts YYYY-MM-DD or DD-MM-YYYY")
 
 
+def _yf_download_with_retries(ticker: str, start_iso: str, attempts: int = 3, delay_seconds: float = 0.6) -> pd.DataFrame:
+    last_exc = None
+    for i in range(attempts):
+        try:
+            logger.debug("yfinance download attempt %d for %s (start=%s)", i + 1, ticker, start_iso)
+            df = yf.download(ticker, start=start_iso, progress=False, threads=False, auto_adjust=False)
+            return df
+        except Exception as e:
+            last_exc = e
+            logger.warning("yfinance download attempt %d failed for %s: %s", i + 1, ticker, e)
+            time.sleep(delay_seconds * (1 + i))
+    if last_exc:
+        logger.exception("yfinance final failure for %s", ticker)
+    return pd.DataFrame()
+
+
 def fetch_history(ticker: str, start_date: date) -> pd.DataFrame:
-    """
-    Fetch historical data using yfinance.
-    Returns a DataFrame (may be empty) or raises ValueError on failure.
-    """
-    try:
-        logger.info("Fetching %s from yfinance starting %s", ticker, start_date.isoformat())
-        df = yf.download(ticker, start=start_date.isoformat(), progress=False, threads=False, auto_adjust=False)
-    except Exception as e:
-        logger.exception("yfinance download error for %s", ticker)
-        raise ValueError(f"yfinance download error for {ticker}: {e}")
-
+    start_iso = start_date.isoformat()
+    logger.info("Fetching %s from yfinance starting %s", ticker, start_iso)
+    df = _yf_download_with_retries(ticker, start_iso)
     if df is None or df.empty:
-        raise ValueError(f"No price data returned for {ticker}")
-
+        logger.warning("No data returned from yfinance for %s (start=%s) - empty DataFrame", ticker, start_iso)
+        return pd.DataFrame()
     return df
 
 
 def extract_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
-    """
-    Return a pd.Series of close prices (index=Date, name='close').
-    Works with multiindex columns (from yfinance) and single-level columns.
-    """
     if df is None or df.empty:
         return None
 
-    # If columns are tuples (multiindex), convert to single strings
     new_cols = []
     for c in df.columns:
         if isinstance(c, tuple):
@@ -78,10 +82,8 @@ def extract_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
     df = df.copy()
     df.columns = new_cols
 
-    # Build map of lowercase->original name (normalize)
     col_map = {c.lower().replace(" ", "").replace("-", ""): c for c in df.columns}
 
-    # Prefer Adj Close variants
     adj_candidates = [orig for k, orig in col_map.items() if "adj" in k and "close" in k]
     if not adj_candidates:
         adj_candidates = [orig for k, orig in col_map.items() if "adj" in k]
@@ -90,27 +92,21 @@ def extract_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
     elif "close" in col_map:
         col = col_map["close"]
     else:
-        # fallback: pick the last numeric column
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if not numeric_cols:
             return None
         col = numeric_cols[-1]
 
     s = df[col].dropna().rename("close")
-    # Ensure index is datetime and sorted
     s.index = pd.to_datetime(s.index)
     s = s.sort_index()
     return s
 
 
 def compute_metrics(series: pd.Series, start_date: date, investment_amount: Optional[float]) -> Dict[str, Any]:
-    """
-    Compute start price, current price, return, annualized, units, current value etc.
-    """
     if series is None or series.empty:
         raise ValueError("Empty price series")
 
-    # find first price on/after start_date
     series_sorted = series.sort_index()
     start_idx = series_sorted.index.searchsorted(pd.Timestamp(start_date))
     if start_idx >= len(series_sorted):
@@ -118,10 +114,8 @@ def compute_metrics(series: pd.Series, start_date: date, investment_amount: Opti
     start_price = float(series_sorted.iloc[start_idx])
     current_price = float(series_sorted.iloc[-1])
 
-    # simple return
     total_return = (current_price / start_price - 1.0) * 100.0
 
-    # annualized (CAGR)
     days = (series_sorted.index[-1] - series_sorted.index[start_idx]).days
     if days <= 0:
         annualized_pct = 0.0
@@ -149,15 +143,10 @@ def compute_metrics(series: pd.Series, start_date: date, investment_amount: Opti
 
 
 def history_to_list(series: pd.Series) -> List[Dict[str, Any]]:
-    """Convert price series to list of {"date": "YYYY-MM-DD", "close": value}"""
     return [{"date": idx.date().isoformat(), "close": float(v)} for idx, v in series.items()]
 
 
 def fetch_news_for_symbol(symbol: str, max_items: int = 10) -> List[Dict[str, str]]:
-    """
-    Fetch Google News RSS for the symbol (URL-encoded). Returns list of dicts with title/link/published.
-    Uses simple XML parsing to avoid extra deps.
-    """
     query = f"{symbol} stock"
     url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
@@ -182,57 +171,59 @@ def fetch_news_for_symbol(symbol: str, max_items: int = 10) -> List[Dict[str, st
     return items
 
 
-# --- Index fetching helpers -----------------------------------------------
-# We'll fetch a small set of benchmark indices for .NS symbols by default.
-# Yahoo tickers commonly: NIFTY 50 = ^NSEI, BSE SENSEX = ^BSESN
-DEFAULT_INDICES_FOR_NS = {
-    "NIFTY50": "^NSEI",
-    "SENSEX": "^BSESN",
-}
+# ---------- Index support ----------
+DEFAULT_INDEX_TICKERS = [
+    {"symbol": "^NSEI", "label": "^NSEI"},
+    {"symbol": "^BSESN", "label": "^BSESN"},
+]
 
 
-def fetch_indices_for_symbol(symbol: str, start_date: date) -> List[Dict[str, Any]]:
-    """
-    Given a stock symbol, return a list of index dicts:
-    [{"symbol": "^NSEI", "history": [...], "start_price": x, "current_price": y}, ...]
-    If no indices are applicable or fetch fails, returns an empty list.
-    """
-    indices_out: List[Dict[str, Any]] = []
-
-    # simple rule: if symbol endswith .NS (NSE India), include NIFTY/SENSEX
-    symbol_upper = symbol.strip().upper()
-    if symbol_upper.endswith(".NS"):
-        chosen = DEFAULT_INDICES_FOR_NS.values()
-    else:
-        # you can extend rules for .TO, .L, .NZ etc
-        chosen = []
-
-    for idx_ticker in chosen:
+def fetch_indexes(start_date: date) -> List[Dict[str, Any]]:
+    indexes = []
+    for idx_def in DEFAULT_INDEX_TICKERS:
+        t = idx_def["symbol"]
         try:
-            df_idx = fetch_history(idx_ticker, start_date)
-            ser_idx = extract_close_series(df_idx)
-            if ser_idx is None or ser_idx.empty:
-                logger.warning("No index data for %s", idx_ticker)
+            df = fetch_history(t, start_date)
+            series = extract_close_series(df)
+            if series is None or series.empty:
+                logger.warning("Index %s returned no data", t)
+                indexes.append({
+                    "symbol": t,
+                    "label": idx_def.get("label", t),
+                    "history": [],
+                    "start_price": None,
+                    "current_price": None,
+                    "history_points": 0,
+                    "error": "no_data",
+                })
                 continue
-            hist = history_to_list(ser_idx)
-            # compute quick metrics for the index
-            idx_metrics = compute_metrics(ser_idx, start_date, None)
-            indices_out.append({
-                "symbol": idx_ticker,
+
+            metrics = compute_metrics(series, start_date, None)
+            hist = history_to_list(series)
+            indexes.append({
+                "symbol": t,
+                "label": idx_def.get("label", t),
                 "history": hist,
-                "start_price": idx_metrics.get("start_price"),
-                "current_price": idx_metrics.get("current_price"),
-                "history_points": idx_metrics.get("history_points"),
+                "start_price": metrics.get("start_price"),
+                "current_price": metrics.get("current_price"),
+                "history_points": metrics.get("history_points"),
             })
         except Exception as e:
-            logger.exception("Failed to fetch index %s: %s", idx_ticker, e)
-            # continue to next index (do not fail entire analysis)
-            continue
+            logger.exception("Failed to fetch index %s: %s", t, e)
+            indexes.append({
+                "symbol": t,
+                "label": idx_def.get("label", t),
+                "history": [],
+                "start_price": None,
+                "current_price": None,
+                "history_points": 0,
+                "error": "exception",
+                "message": str(e),
+            })
+    return indexes
 
-    return indices_out
 
-
-# --- API routes -----------------------------------------------------------
+# ---------- FastAPI handlers ----------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -250,7 +241,6 @@ def analysis(req: AnalysisRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        # Fetch stock history
         df = fetch_history(symbol, start_dt)
         series = extract_close_series(df)
         if series is None or series.empty:
@@ -258,15 +248,10 @@ def analysis(req: AnalysisRequest):
 
         metrics = compute_metrics(series, start_dt, req.investment_amount)
         history_list = history_to_list(series)
-
-        # Fetch indices (non-blocking failures)
-        try:
-            indices = fetch_indices_for_symbol(symbol, start_dt)
-        except Exception:
-            logger.exception("fetch_indices_for_symbol failed")
-            indices = []
-
         headlines = fetch_news_for_symbol(symbol, max_items=10)
+
+        # fetch indexes (always return a list)
+        indexes = fetch_indexes(start_dt)
 
         result = {
             "symbol": symbol,
@@ -276,13 +261,13 @@ def analysis(req: AnalysisRequest):
             "current_value": metrics.get("current_value"),
             "headlines": headlines,
             "history": history_list,
-            "indices": indices,  # <-- new field for frontend to render index lines
             "start_date": metrics.get("start_date"),
             "start_price": metrics.get("start_price"),
             "current_price": metrics.get("current_price"),
             "return_pct": metrics.get("return_pct"),
             "annualized_pct": metrics.get("annualized_pct"),
             "history_points": metrics.get("history_points"),
+            "indexes": indexes,
         }
         return result
 
