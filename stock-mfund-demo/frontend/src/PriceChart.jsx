@@ -1,161 +1,142 @@
-// PriceChart.jsx
+// src/PriceChart.jsx
 import React, { useMemo } from "react";
 import {
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
+  Chart as ChartJS,
+  LineElement,
+  PointElement,
+  CategoryScale,
+  LinearScale,
+  TimeScale,
   Tooltip,
   Legend,
-} from "recharts";
+} from "chart.js";
+import { Line } from "react-chartjs-2";
+import "chartjs-adapter-date-fns";
 
-/*
-Props:
- - history: [{date: "YYYY-MM-DD", close: number}, ...]   // stock series
- - benchmarks: { nifty?: [{date, close}], sensex?: [{date, close}] }
- - normalize: boolean (default true) -> normalize each series to 100 at its first datapoint
- - height: optional (default 380)
-*/
+ChartJS.register(
+  LineElement,
+  PointElement,
+  CategoryScale,
+  LinearScale,
+  TimeScale,
+  Tooltip,
+  Legend
+);
 
-function fmtDateLabel(d) {
-  try {
-    const dt = new Date(d);
-    if (isNaN(dt.getTime())) return d;
-    return dt.toLocaleDateString(undefined, { year: "numeric", month: "short" });
-  } catch {
-    return d;
-  }
-}
+/**
+ * Align series by date and optionally normalize them (start = 100).
+ * Input:
+ *   stock: [{date: "YYYY-MM-DD", close: number}, ...]
+ *   indexes: [{symbol, history: [{date, close}, ...]}, ...]
+ */
+function alignSeries(primary, others = []) {
+  // build set of all dates (use primary's dates as baseline for plotting)
+  const dateSet = new Set(primary.map((r) => r.date));
+  // ensure other dates are included (so indexes don't truncate)
+  others.forEach((ix) => ix.history.forEach((r) => dateSet.add(r.date)));
+  const dates = Array.from(dateSet).sort((a, b) => new Date(a) - new Date(b));
 
-function mergeSeries(stock = [], benchmarks = {}) {
-  // Build map keyed by date with stock/index closes
-  const map = new Map();
-  const push = (arr, keyName) => {
-    if (!Array.isArray(arr)) return;
-    for (const r of arr) {
-      const date = r.date || r.dt || r.x;
-      if (!date) continue;
-      const e = map.get(date) || { date };
-      if (r.close !== undefined) e[keyName] = r.close;
-      if (r.stock !== undefined) e.stock = r.stock;
-      if (r.index !== undefined) e.index = r.index;
-      map.set(date, e);
-    }
+  const mapSeries = (arr) => {
+    const m = new Map(arr.map((r) => [r.date, r.close]));
+    return dates.map((d) => (m.has(d) ? m.get(d) : null));
   };
 
-  push(stock, "stock");
-  if (benchmarks.nifty) push(benchmarks.nifty, "nifty");
-  if (benchmarks.sensex) push(benchmarks.sensex, "sensex");
+  const primaryVals = mapSeries(primary);
+  const otherVals = others.map((ix) => ({ symbol: ix.symbol, vals: mapSeries(ix.history) }));
 
-  const arr = Array.from(map.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
-  return arr;
+  return { dates, primaryVals, otherVals };
 }
 
-function normalizeSeries(data, keys = ["stock", "nifty", "sensex"]) {
-  // create a copy and normalize each key so first non-null value becomes 100
-  const first = {};
-  for (const k of keys) first[k] = null;
+function normalizeArray(arr) {
+  // find first non-null
+  const idx = arr.findIndex((v) => v !== null && v !== undefined);
+  if (idx === -1) return arr.map(() => null);
+  const start = arr[idx];
+  if (!start || start === 0) return arr.map(() => null);
+  return arr.map((v) => (v === null || v === undefined ? null : (v / start) * 100));
+}
 
-  for (const row of data) {
-    for (const k of keys) {
-      if (first[k] === null && row[k] != null) first[k] = row[k];
-    }
-    // if all found, break early
-    if (Object.values(first).every((v) => v !== null)) break;
-  }
+function buildDatasets(dates, primaryVals, otherVals, normalize) {
+  const datasets = [];
 
-  // produce normalized copy
-  return data.map((row) => {
-    const r = { ...row };
-    for (const k of keys) {
-      if (r[k] != null && first[k] != null && first[k] !== 0) {
-        r[`${k}_norm`] = (r[k] / first[k]) * 100;
-      } else {
-        r[`${k}_norm`] = null;
-      }
-    }
-    return r;
+  const pVals = normalize ? normalizeArray(primaryVals) : primaryVals;
+  datasets.push({
+    label: "Stock",
+    data: dates.map((d, i) => ({ x: d, y: pVals[i] })),
+    borderColor: "#2f72d6",
+    backgroundColor: "rgba(47,114,214,0.06)",
+    pointRadius: 0.5,
+    tension: 0.15,
   });
+
+  const palette = ["#f39c12", "#2ecc71", "#9b59b6", "#e74c3c"];
+  otherVals.forEach((ix, idx) => {
+    const vals = normalize ? normalizeArray(ix.vals) : ix.vals;
+    datasets.push({
+      label: ix.symbol,
+      data: dates.map((d, i) => ({ x: d, y: vals[i] })),
+      borderColor: palette[idx % palette.length],
+      backgroundColor: "transparent",
+      borderDash: [6, 4],
+      pointRadius: 0,
+      tension: 0.15,
+      yAxisID: normalize ? "y" : `y${idx > 0 ? idx + 1 : ""}`, // allow multiple axes if absolute
+    });
+  });
+
+  return datasets;
 }
 
-export default function PriceChart({ history = [], benchmarks = {}, normalize = true, height = 380 }) {
-  const merged = useMemo(() => mergeSeries(history, benchmarks), [history, benchmarks]);
-  if (!merged || merged.length === 0) {
-    return (
-      <div style={{ minHeight: 260, display: "flex", alignItems: "center", justifyContent: "center", color: "#666" }}>
-        No series available to render chart.
-      </div>
-    );
-  }
+export default function PriceChart({ stock = [], indexes = [], normalize = true, height = 420 }) {
+  const { dates, primaryVals, otherVals } = useMemo(() => alignSeries(stock, indexes), [stock, indexes]);
 
-  // choose keys we might plot
-  const hasStock = merged.some((d) => d.stock != null);
-  const hasNifty = merged.some((d) => d.nifty != null);
-  const hasSensex = merged.some((d) => d.sensex != null);
+  const datasets = useMemo(() => buildDatasets(dates, primaryVals, otherVals, normalize), [dates, primaryVals, otherVals, normalize]);
 
-  // normalized data (if requested) - adds stock_norm, nifty_norm, sensex_norm
-  const plotted = useMemo(() => {
-    if (!normalize) return merged;
-    return normalizeSeries(merged, ["stock", "nifty", "sensex"]);
-  }, [merged, normalize]);
+  // Determine right-side axis if not normalized (absolute indexes typically have much larger scale)
+  const options = useMemo(() => {
+    const base = {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        x: {
+          type: "time",
+          time: { unit: "month", tooltipFormat: "yyyy-MM-dd" },
+          ticks: { autoSkip: true, maxTicksLimit: 18 },
+          grid: { color: "rgba(0,0,0,0.06)" },
+        },
+        y: {
+          beginAtZero: true,
+          position: "left",
+          grid: { color: "rgba(0,0,0,0.06)" },
+          title: {
+            display: !!normalize,
+            text: normalize ? "Normalized (start=100)" : undefined,
+          },
+        },
+      },
+      plugins: {
+        legend: { position: "bottom" },
+        tooltip: { mode: "index", intersect: false },
+      },
+    };
 
-  // keys to use depending on normalize toggle
-  const stockKey = normalize ? "stock_norm" : "stock";
-  const niftyKey = normalize ? "nifty_norm" : "nifty";
-  const sensexKey = normalize ? "sensex_norm" : "sensex";
+    // if not normalized and we have >0 indexes, add right y-axis for indexes
+    if (!normalize && indexes && indexes.length > 0) {
+      base.scales["yRight"] = {
+        position: "right",
+        grid: { drawOnChartArea: false },
+        beginAtZero: false,
+      };
+    }
+
+    return base;
+  }, [normalize, indexes]);
+
+  const data = { datasets };
 
   return (
-    <div style={{ width: "100%", height }}>
-      <ResponsiveContainer>
-        <LineChart data={plotted} margin={{ top: 12, right: 30, left: 0, bottom: 40 }}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="date" tickFormatter={fmtDateLabel} minTickGap={30} />
-          <YAxis allowDecimals />
-          <Tooltip formatter={(v) => (typeof v === "number" ? v.toFixed(2) : v)} />
-          <Legend verticalAlign="bottom" height={36} />
-
-          {hasNifty && (
-            <Line
-              type="monotone"
-              dataKey={niftyKey}
-              stroke="#FF8A00"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-              connectNulls={true}
-              name={normalize ? "Nifty (index, normalized)" : "Nifty"}
-            />
-          )}
-
-          {hasSensex && (
-            <Line
-              type="monotone"
-              dataKey={sensexKey}
-              stroke="#AA00CC"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-              connectNulls={true}
-              name={normalize ? "Sensex (index, normalized)" : "Sensex"}
-            />
-          )}
-
-          {hasStock && (
-            <Line
-              type="monotone"
-              dataKey={stockKey}
-              stroke="#2F86F6"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-              connectNulls={true}
-              name={normalize ? "Stock (normalized)" : "Stock"}
-            />
-          )}
-        </LineChart>
-      </ResponsiveContainer>
+    <div style={{ height }}>
+      <Line data={data} options={options} />
     </div>
   );
 }
