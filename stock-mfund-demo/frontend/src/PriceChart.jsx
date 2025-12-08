@@ -1,141 +1,170 @@
-// src/PriceChart.jsx
 import React, { useMemo } from "react";
+import { Chart, Line } from "react-chartjs-2";
 import {
-  Chart as ChartJS,
-  LineElement,
-  PointElement,
   CategoryScale,
   LinearScale,
   TimeScale,
+  PointElement,
+  LineElement,
+  Title,
   Tooltip,
   Legend,
 } from "chart.js";
-import { Line } from "react-chartjs-2";
-import "chartjs-adapter-date-fns";
 
-ChartJS.register(
-  LineElement,
-  PointElement,
-  CategoryScale,
-  LinearScale,
-  TimeScale,
-  Tooltip,
-  Legend
-);
+// register scales & elements we use
+Chart.register(CategoryScale, LinearScale, TimeScale, PointElement, LineElement, Title, Tooltip, Legend);
 
-/**
- * Align series by date and optionally normalize them (start = 100).
- * Input:
- *   stock: [{date: "YYYY-MM-DD", close: number}, ...]
- *   indexes: [{symbol, history: [{date, close}, ...]}, ...]
- */
-function alignSeries(primary, others = []) {
-  // build set of all dates (use primary's dates as baseline for plotting)
-  const dateSet = new Set(primary.map((r) => r.date));
-  // ensure other dates are included (so indexes don't truncate)
-  others.forEach((ix) => ix.history.forEach((r) => dateSet.add(r.date)));
-  const dates = Array.from(dateSet).sort((a, b) => new Date(a) - new Date(b));
-
-  const mapSeries = (arr) => {
-    const m = new Map(arr.map((r) => [r.date, r.close]));
-    return dates.map((d) => (m.has(d) ? m.get(d) : null));
-  };
-
-  const primaryVals = mapSeries(primary);
-  const otherVals = others.map((ix) => ({ symbol: ix.symbol, vals: mapSeries(ix.history) }));
-
-  return { dates, primaryVals, otherVals };
+function toSeries(history) {
+  // history expected [{date: "YYYY-MM-DD", close: number}, ...]
+  return history.map(h => ({ x: h.date, y: Number(h.close) }));
 }
 
-function normalizeArray(arr) {
-  // find first non-null
-  const idx = arr.findIndex((v) => v !== null && v !== undefined);
-  if (idx === -1) return arr.map(() => null);
-  const start = arr[idx];
-  if (!start || start === 0) return arr.map(() => null);
-  return arr.map((v) => (v === null || v === undefined ? null : (v / start) * 100));
-}
+export default function PriceChart({ history = [], indexes = [], viewMode = "normalized", showOverlays = true }) {
+  // main stock series
+  const stockSeries = useMemo(() => toSeries(history), [history]);
 
-function buildDatasets(dates, primaryVals, otherVals, normalize) {
-  const datasets = [];
+  // build index series list (each index is {symbol, history: [{date, close}, ...], start_price, current_price, history_points})
+  const indexSeries = useMemo(() => {
+    return (indexes || []).map(idx => ({ symbol: idx.symbol, series: toSeries(idx.history || []) }));
+  }, [indexes]);
 
-  const pVals = normalize ? normalizeArray(primaryVals) : primaryVals;
-  datasets.push({
-    label: "Stock",
-    data: dates.map((d, i) => ({ x: d, y: pVals[i] })),
-    borderColor: "#2f72d6",
-    backgroundColor: "rgba(47,114,214,0.06)",
-    pointRadius: 0.5,
-    tension: 0.15,
-  });
+  // compute normalized series: base = first value (on start)
+  const normalizedStock = useMemo(() => {
+    if (!stockSeries.length) return [];
+    const base = stockSeries[0].y || 1;
+    return stockSeries.map(p => ({ x: p.x, y: (p.y / base) * 100 }));
+  }, [stockSeries]);
 
-  const palette = ["#f39c12", "#2ecc71", "#9b59b6", "#e74c3c"];
-  otherVals.forEach((ix, idx) => {
-    const vals = normalize ? normalizeArray(ix.vals) : ix.vals;
-    datasets.push({
-      label: ix.symbol,
-      data: dates.map((d, i) => ({ x: d, y: vals[i] })),
-      borderColor: palette[idx % palette.length],
-      backgroundColor: "transparent",
-      borderDash: [6, 4],
-      pointRadius: 0,
-      tension: 0.15,
-      yAxisID: normalize ? "y" : `y${idx > 0 ? idx + 1 : ""}`, // allow multiple axes if absolute
+  const normalizedIndexes = useMemo(() => {
+    if (!indexSeries.length) return [];
+    return indexSeries.map(idx => {
+      if (!idx.series.length) return { symbol: idx.symbol, series: [] };
+      const base = idx.series[0].y || 1;
+      return { symbol: idx.symbol, series: idx.series.map(p => ({ x: p.x, y: (p.y / base) * 100 })) };
     });
-  });
+  }, [indexSeries]);
 
-  return datasets;
-}
+  // datasets for chartjs
+  const datasets = useMemo(() => {
+    const ds = [];
 
-export default function PriceChart({ stock = [], indexes = [], normalize = true, height = 420 }) {
-  const { dates, primaryVals, otherVals } = useMemo(() => alignSeries(stock, indexes), [stock, indexes]);
+    if (viewMode === "normalized") {
+      // stock normalized
+      ds.push({
+        label: "Stock",
+        data: normalizedStock,
+        borderColor: "#2f6bd8",
+        backgroundColor: "rgba(47,107,216,0.08)",
+        pointRadius: 2,
+        borderWidth: 2,
+        tension: 0.12,
+      });
 
-  const datasets = useMemo(() => buildDatasets(dates, primaryVals, otherVals, normalize), [dates, primaryVals, otherVals, normalize]);
+      if (showOverlays) {
+        const palette = ["#f39c12", "#2ecc71", "#e74c3c", "#8e44ad"];
+        normalizedIndexes.forEach((idx, i) => {
+          ds.push({
+            label: idx.symbol || `Index ${i+1}`,
+            data: idx.series,
+            borderColor: palette[i % palette.length],
+            borderDash: [6, 4],
+            pointRadius: 0,
+            borderWidth: 1.5,
+            tension: 0.12,
+          });
+        });
+      }
+    } else {
+      // Absolute view: show stock on left axis, indexes on right axis
+      ds.push({
+        label: "Stock",
+        data: stockSeries,
+        borderColor: "#2f6bd8",
+        backgroundColor: "rgba(47,107,216,0.08)",
+        yAxisID: "y-left",
+        pointRadius: 2,
+        borderWidth: 2,
+        tension: 0.12,
+      });
 
-  // Determine right-side axis if not normalized (absolute indexes typically have much larger scale)
+      if (showOverlays) {
+        const palette = ["#f39c12", "#2ecc71", "#e74c3c", "#8e44ad"];
+        indexSeries.forEach((idx, i) => {
+          ds.push({
+            label: idx.symbol || `Index ${i+1}`,
+            data: idx.series,
+            borderColor: palette[i % palette.length],
+            borderDash: [6, 4],
+            pointRadius: 0,
+            borderWidth: 1.5,
+            tension: 0.12,
+            yAxisID: "y-right",
+          });
+        });
+      }
+    }
+
+    return ds;
+  }, [viewMode, normalizedStock, normalizedIndexes, stockSeries, indexSeries, showOverlays]);
+
+  // x labels will be time-based; Chart.js time scale requires a time adapter if using native time parsing.
+  // To avoid requiring an adapter install in all environments we provide string x values and use CategoryScale with label rotation.
+  // However, TimeScale works fine if your build included chartjs-adapter-date-fns; many projects already have it.
+  // We're going to configure the x scale as 'time' and pass string dates - Chart.js can parse ISO strings when adapter present.
+  const data = useMemo(() => ({ datasets }), [datasets]);
+
   const options = useMemo(() => {
-    const base = {
+    return {
       maintainAspectRatio: false,
-      responsive: true,
-      scales: {
-        x: {
-          type: "time",
-          time: { unit: "month", tooltipFormat: "yyyy-MM-dd" },
-          ticks: { autoSkip: true, maxTicksLimit: 18 },
-          grid: { color: "rgba(0,0,0,0.06)" },
+      interaction: { mode: "nearest", intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: "bottom",
+          labels: { boxWidth: 14, boxHeight: 8, usePointStyle: true },
         },
-        y: {
-          beginAtZero: true,
-          position: "left",
-          grid: { color: "rgba(0,0,0,0.06)" },
-          title: {
-            display: !!normalize,
-            text: normalize ? "Normalized (start=100)" : undefined,
+        tooltip: {
+          callbacks: {
+            label: function (context) {
+              const val = context.parsed.y;
+              return `${context.dataset.label}: ${Number(val).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+            },
           },
         },
       },
-      plugins: {
-        legend: { position: "bottom" },
-        tooltip: { mode: "index", intersect: false },
+      scales: {
+        x: {
+          type: "time",
+          time: {
+            parser: "YYYY-MM-DD",
+            tooltipFormat: "ll",
+            unit: "month",
+            displayFormats: { month: "MMM YYYY" },
+          },
+          ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+          grid: { display: false },
+        },
+        "y-left": {
+          type: "linear",
+          position: "left",
+          beginAtZero: false,
+          grid: { drawOnChartArea: true },
+          title: { display: viewMode === "normalized", text: viewMode === "normalized" ? "Normalized (start=100)" : "Stock (price)" },
+        },
+        "y-right": {
+          type: "linear",
+          position: "right",
+          beginAtZero: false,
+          grid: { display: false },
+          // Only used in absolute mode for indexes
+          title: { display: viewMode === "absolute", text: "Index (price)" },
+        },
       },
     };
-
-    // if not normalized and we have >0 indexes, add right y-axis for indexes
-    if (!normalize && indexes && indexes.length > 0) {
-      base.scales["yRight"] = {
-        position: "right",
-        grid: { drawOnChartArea: false },
-        beginAtZero: false,
-      };
-    }
-
-    return base;
-  }, [normalize, indexes]);
-
-  const data = { datasets };
+  }, [viewMode]);
 
   return (
-    <div style={{ height }}>
+    <div style={{ height: "100%", width: "100%" }}>
       <Line data={data} options={options} />
     </div>
   );

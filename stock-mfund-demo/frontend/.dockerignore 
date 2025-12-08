@@ -1,0 +1,12 @@
+# Node / build artifacts — do NOT send these into Docker build context
+node_modules
+dist
+.vscode
+.DS_Store
+.git
+.gitignore
+npm-debug.log
+.env
+.env.local
+.idea
+*.log
