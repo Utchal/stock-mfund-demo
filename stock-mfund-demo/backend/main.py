@@ -1,281 +1,174 @@
-# backend/main.py
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime, date
+from datetime import datetime
+from typing import List
+
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pandas as pd
-import yfinance as yf
-import requests
-import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus
-import time
+from nsepython import equity_history, index_history
 
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
+logger = logging.getLogger("nse-backend")
 
-app = FastAPI(title="Stock & Index Analysis API")
+# --------------------------------------------------
+# FastAPI app
+# --------------------------------------------------
+app = FastAPI(title="NSE Stock Analysis API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust for prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# --------------------------------------------------
+# Models
+# --------------------------------------------------
 class AnalysisRequest(BaseModel):
-    symbol: str
-    start_date: str  # accepts multiple formats
-    investment_amount: Optional[float] = None
+    symbol: str            # e.g. RELIANCE
+    start_date: str        # DD-MM-YYYY
+    investment: float = 10000
+    show_indices: bool = True
 
 
-# ---------- utilities ----------
-def parse_start_date(s: str) -> date:
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            continue
-    raise ValueError(f"Invalid start_date format: {s}. Accepts YYYY-MM-DD or DD-MM-YYYY")
+class PricePoint(BaseModel):
+    date: str
+    close: float
 
 
-def _yf_download_with_retries(ticker: str, start_iso: str, attempts: int = 3, delay_seconds: float = 0.6) -> pd.DataFrame:
-    last_exc = None
-    for i in range(attempts):
-        try:
-            logger.debug("yfinance download attempt %d for %s (start=%s)", i + 1, ticker, start_iso)
-            df = yf.download(ticker, start=start_iso, progress=False, threads=False, auto_adjust=False)
-            return df
-        except Exception as e:
-            last_exc = e
-            logger.warning("yfinance download attempt %d failed for %s: %s", i + 1, ticker, e)
-            time.sleep(delay_seconds * (1 + i))
-    if last_exc:
-        logger.exception("yfinance final failure for %s", ticker)
-    return pd.DataFrame()
-
-
-def fetch_history(ticker: str, start_date: date) -> pd.DataFrame:
-    start_iso = start_date.isoformat()
-    logger.info("Fetching %s from yfinance starting %s", ticker, start_iso)
-    df = _yf_download_with_retries(ticker, start_iso)
-    if df is None or df.empty:
-        logger.warning("No data returned from yfinance for %s (start=%s) - empty DataFrame", ticker, start_iso)
-        return pd.DataFrame()
-    return df
-
-
-def extract_close_series(df: pd.DataFrame) -> Optional[pd.Series]:
-    if df is None or df.empty:
-        return None
-
-    new_cols = []
-    for c in df.columns:
-        if isinstance(c, tuple):
-            joined = "|".join([str(x) for x in c if x is not None and str(x) != ""])
-            new_cols.append(joined)
-        else:
-            new_cols.append(str(c))
-    df = df.copy()
-    df.columns = new_cols
-
-    col_map = {c.lower().replace(" ", "").replace("-", ""): c for c in df.columns}
-
-    adj_candidates = [orig for k, orig in col_map.items() if "adj" in k and "close" in k]
-    if not adj_candidates:
-        adj_candidates = [orig for k, orig in col_map.items() if "adj" in k]
-    if adj_candidates:
-        col = adj_candidates[0]
-    elif "close" in col_map:
-        col = col_map["close"]
-    else:
-        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if not numeric_cols:
-            return None
-        col = numeric_cols[-1]
-
-    s = df[col].dropna().rename("close")
-    s.index = pd.to_datetime(s.index)
-    s = s.sort_index()
-    return s
-
-
-def compute_metrics(series: pd.Series, start_date: date, investment_amount: Optional[float]) -> Dict[str, Any]:
-    if series is None or series.empty:
-        raise ValueError("Empty price series")
-
-    series_sorted = series.sort_index()
-    start_idx = series_sorted.index.searchsorted(pd.Timestamp(start_date))
-    if start_idx >= len(series_sorted):
-        raise ValueError("No historical data starting at or after the requested start date")
-    start_price = float(series_sorted.iloc[start_idx])
-    current_price = float(series_sorted.iloc[-1])
-
-    total_return = (current_price / start_price - 1.0) * 100.0
-
-    days = (series_sorted.index[-1] - series_sorted.index[start_idx]).days
-    if days <= 0:
-        annualized_pct = 0.0
-    else:
-        years = days / 365.25
-        annualized_pct = (current_price / start_price) ** (1 / years) - 1
-        annualized_pct *= 100.0
-
-    units = None
-    current_value = None
-    if investment_amount is not None and investment_amount > 0:
-        units = investment_amount / start_price
-        current_value = units * current_price
-
-    return {
-        "start_date": series_sorted.index[start_idx].date().isoformat(),
-        "start_price": start_price,
-        "current_price": current_price,
-        "return_pct": total_return,
-        "annualized_pct": annualized_pct,
-        "units": units,
-        "current_value": current_value,
-        "history_points": len(series_sorted),
-    }
-
-
-def history_to_list(series: pd.Series) -> List[Dict[str, Any]]:
-    return [{"date": idx.date().isoformat(), "close": float(v)} for idx, v in series.items()]
-
-
-def fetch_news_for_symbol(symbol: str, max_items: int = 10) -> List[Dict[str, str]]:
-    query = f"{symbol} stock"
-    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+def parse_date(value: str) -> datetime:
     try:
-        resp = requests.get(url, timeout=8)
-        resp.raise_for_status()
+        return datetime.strptime(value, "%d-%m-%Y")
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date must be DD-MM-YYYY",
+        )
+
+
+def fetch_stock(symbol: str, start: datetime) -> List[PricePoint]:
+    try:
+        logger.info(f"Fetching NSE stock: {symbol}")
+        data = equity_history(
+            symbol=symbol,
+            series="EQ",
+            start_date=start.strftime("%d-%m-%Y"),
+            end_date=datetime.today().strftime("%d-%m-%Y"),
+        )
+
+        df = pd.DataFrame(data)
+        if df.empty:
+            return []
+
+        return [
+            PricePoint(
+                date=row["CH_TIMESTAMP"].split("T")[0],
+                close=float(row["CH_CLOSING_PRICE"]),
+            )
+            for _, row in df.iterrows()
+        ]
     except Exception as e:
-        logger.exception("Failed to fetch news RSS for %s: %s", symbol, e)
+        logger.error(f"Stock fetch failed: {e}")
         return []
 
+
+def fetch_index(name: str, start: datetime) -> List[PricePoint]:
     try:
-        root = ET.fromstring(resp.content)
+        logger.info(f"Fetching index: {name}")
+        data = index_history(
+            index=name,
+            start_date=start.strftime("%d-%m-%Y"),
+            end_date=datetime.today().strftime("%d-%m-%Y"),
+        )
+
+        df = pd.DataFrame(data)
+        if df.empty:
+            return []
+
+        return [
+            PricePoint(
+                date=row["HistoricalDate"].split("T")[0],
+                close=float(row["CLOSE"]),
+            )
+            for _, row in df.iterrows()
+        ]
     except Exception as e:
-        logger.exception("Failed to parse news XML: %s", e)
+        logger.error(f"Index fetch failed: {e}")
         return []
 
-    items = []
-    for item in root.findall(".//item")[:max_items]:
-        title = item.findtext("title") or ""
-        link = item.findtext("link") or ""
-        pub = item.findtext("pubDate") or ""
-        items.append({"title": title, "link": link, "published": pub})
-    return items
 
-
-# ---------- Index support ----------
-DEFAULT_INDEX_TICKERS = [
-    {"symbol": "^NSEI", "label": "^NSEI"},
-    {"symbol": "^BSESN", "label": "^BSESN"},
-]
-
-
-def fetch_indexes(start_date: date) -> List[Dict[str, Any]]:
-    indexes = []
-    for idx_def in DEFAULT_INDEX_TICKERS:
-        t = idx_def["symbol"]
-        try:
-            df = fetch_history(t, start_date)
-            series = extract_close_series(df)
-            if series is None or series.empty:
-                logger.warning("Index %s returned no data", t)
-                indexes.append({
-                    "symbol": t,
-                    "label": idx_def.get("label", t),
-                    "history": [],
-                    "start_price": None,
-                    "current_price": None,
-                    "history_points": 0,
-                    "error": "no_data",
-                })
-                continue
-
-            metrics = compute_metrics(series, start_date, None)
-            hist = history_to_list(series)
-            indexes.append({
-                "symbol": t,
-                "label": idx_def.get("label", t),
-                "history": hist,
-                "start_price": metrics.get("start_price"),
-                "current_price": metrics.get("current_price"),
-                "history_points": metrics.get("history_points"),
-            })
-        except Exception as e:
-            logger.exception("Failed to fetch index %s: %s", t, e)
-            indexes.append({
-                "symbol": t,
-                "label": idx_def.get("label", t),
-                "history": [],
-                "start_price": None,
-                "current_price": None,
-                "history_points": 0,
-                "error": "exception",
-                "message": str(e),
-            })
-    return indexes
-
-
-# ---------- FastAPI handlers ----------
+# --------------------------------------------------
+# Health
+# --------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+# --------------------------------------------------
+# Main API
+# --------------------------------------------------
 @app.post("/analysis")
-def analysis(req: AnalysisRequest):
-    symbol = req.symbol.strip()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol is required")
+def analyze(req: AnalysisRequest):
+    start = parse_date(req.start_date)
 
-    try:
-        start_dt = parse_start_date(req.start_date)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # ---------------- STOCK ----------------
+    stock_history = fetch_stock(req.symbol.upper(), start)
 
-    try:
-        df = fetch_history(symbol, start_dt)
-        series = extract_close_series(df)
-        if series is None or series.empty:
-            raise HTTPException(status_code=400, detail=f"No price data returned for {symbol}")
-
-        metrics = compute_metrics(series, start_dt, req.investment_amount)
-        history_list = history_to_list(series)
-        headlines = fetch_news_for_symbol(symbol, max_items=10)
-
-        # fetch indexes (always return a list)
-        indexes = fetch_indexes(start_dt)
-
-        result = {
-            "symbol": symbol,
+    if not stock_history:
+        return {
+            "symbol": req.symbol,
+            "history": [],
+            "indexes": [],
+            "error": "No NSE data found",
             "generated_at": datetime.utcnow().isoformat(),
-            "investment_amount": req.investment_amount,
-            "units": metrics.get("units"),
-            "current_value": metrics.get("current_value"),
-            "headlines": headlines,
-            "history": history_list,
-            "start_date": metrics.get("start_date"),
-            "start_price": metrics.get("start_price"),
-            "current_price": metrics.get("current_price"),
-            "return_pct": metrics.get("return_pct"),
-            "annualized_pct": metrics.get("annualized_pct"),
-            "history_points": metrics.get("history_points"),
-            "indexes": indexes,
         }
-        return result
 
-    except HTTPException:
-        raise
-    except ValueError as e:
-        logger.error("analysis failed: %s", e)
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("analysis failed")
-        raise HTTPException(status_code=500, detail="analysis_failed")
+    start_price = stock_history[0].close
+    current_price = stock_history[-1].close
+
+    units = req.investment / start_price
+    current_value = units * current_price
+    return_pct = ((current_value / req.investment) - 1) * 100
+
+    years = max(len(stock_history) / 252, 0.01)
+    annualized_pct = ((current_value / req.investment) ** (1 / years) - 1) * 100
+
+    # ---------------- INDEXES ----------------
+    indexes = []
+    if req.show_indices:
+        for name in ["NIFTY 50", "SENSEX"]:
+            idx_history = fetch_index(name, start)
+            if idx_history:
+                indexes.append({
+                    "symbol": name,
+                    "history": idx_history,
+                    "start_price": idx_history[0].close,
+                    "current_price": idx_history[-1].close,
+                    "history_points": len(idx_history),
+                })
+
+    return {
+        "symbol": req.symbol,
+        "start_date": req.start_date,
+        "investment": req.investment,
+        "units": round(units, 6),
+        "start_price": round(start_price, 2),
+        "current_price": round(current_price, 2),
+        "current_value": round(current_value, 2),
+        "return_pct": round(return_pct, 2),
+        "annualized_pct": round(annualized_pct, 2),
+        "history": stock_history,
+        "history_points": len(stock_history),
+        "indexes": indexes,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
